@@ -328,6 +328,15 @@ impl Session {
         let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
+            if let Some(admission) = turn_context
+                .extension_data
+                .get::<crate::session::WorkflowContinuationAdmission>()
+                && active
+                    .as_ref()
+                    .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &admission.reservation))
+            {
+                return;
+            }
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
             turn.finishing = None;
@@ -345,6 +354,24 @@ impl Session {
         .await;
 
         let mut active = self.active_turn.lock().await;
+        if let Some(admission) = turn_context
+            .extension_data
+            .get::<crate::session::WorkflowContinuationAdmission>()
+        {
+            let reserved = active
+                .as_ref()
+                .is_some_and(|turn| Arc::ptr_eq(&turn.turn_state, &admission.reservation));
+            if !reserved
+                || !self
+                    .workflow_continuation_is_current(&admission.previous_turn_id)
+                    .await
+            {
+                if reserved {
+                    *active = None;
+                }
+                return;
+            }
+        }
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
         // Record lineage only when the task starts: settings changes can invalidate a reservation.

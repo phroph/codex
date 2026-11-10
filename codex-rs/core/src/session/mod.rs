@@ -16,6 +16,7 @@ use crate::agent::AgentStatus;
 use crate::agent::agent_status_from_event;
 use crate::agent::api::AgentConfigUpdate;
 use crate::agent::api::AgentTurnOutcome;
+use crate::agent::api::WorkflowAgentOutcome;
 use crate::agent::control::AgentControlInit;
 use crate::agent::status::is_final;
 use crate::agents_md_manager::SessionInstructions;
@@ -282,6 +283,7 @@ mod token_budget;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
 mod turn_input;
+pub(crate) use turn_input::WorkflowContinuationAdmission;
 mod turn_suspension;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
@@ -1523,6 +1525,25 @@ impl Session {
         matches!(*self.agent_status.borrow(), AgentStatus::Interrupted)
     }
 
+    /// The caller holds the active-turn lock while capturing this idle observation.
+    pub(crate) async fn workflow_idle_outcome(&self) -> Option<WorkflowAgentOutcome> {
+        Some(WorkflowAgentOutcome {
+            thread_id: self.thread_id,
+            turn_id: self.state.lock().await.last_started_turn_id.clone()?,
+            status: self.agent_status.borrow().clone(),
+            idle: true,
+        })
+    }
+
+    /// Revalidate workflow admission while the caller holds the active-turn lock.
+    pub(crate) async fn workflow_continuation_is_current(&self, previous_turn_id: &str) -> bool {
+        let state = self.state.lock().await;
+        !self.is_interrupted()
+            && !state.shutting_down
+            && !self.services.local_agent_runtime.shutdown.is_cancelled()
+            && state.last_started_turn_id.as_deref() == Some(previous_turn_id)
+    }
+
     pub(crate) fn get_tx_event(&self) -> Sender<Event> {
         self.tx_event.clone()
     }
@@ -2613,7 +2634,7 @@ impl Session {
         }
     }
 
-    /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.
+    /// Reports terminal MultiAgentV2 turns to workflow observers and the native parent route.
     async fn maybe_notify_parent_of_terminal_turn(
         &self,
         turn_context: &TurnContext,
@@ -2626,14 +2647,6 @@ impl Session {
         if !matches!(msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) {
             return;
         }
-
-        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            agent_path: Some(_),
-            ..
-        }) = &turn_context.session_source
-        else {
-            return;
-        };
 
         let mut error_info = None;
         let status = match turn_context.terminal_error.lock().await.take() {
@@ -2660,7 +2673,7 @@ impl Session {
                 }
             }
         };
-        if !is_final(&status) {
+        if !is_final(&status) && status != AgentStatus::Interrupted {
             return;
         }
 
@@ -2814,6 +2827,16 @@ impl Session {
     }
 
     async fn deliver_event_raw(&self, event: Event) {
+        if matches!(event.msg, EventMsg::ShutdownComplete) {
+            self.services
+                .local_agent_runtime
+                .publish_workflow_outcome(WorkflowAgentOutcome {
+                    thread_id: self.thread_id,
+                    turn_id: event.id.clone(),
+                    status: AgentStatus::Shutdown,
+                    idle: false,
+                });
+        }
         if let Some(parent_tx) = self.parent_observer_event_tx.get() {
             let forwarded = match &event.msg {
                 EventMsg::RawResponseItem(item) => {
@@ -5668,6 +5691,10 @@ impl Session {
 
     pub async fn interrupt_task(self: &Arc<Self>) {
         info!("interrupt received: abort current task, if any");
+        if crate::workflow::interrupt_owner(self).await {
+            let _active = self.active_turn.lock().await;
+            self.state.lock().await.last_started_turn_id = None;
+        }
         let had_active_turn = self.active_turn.lock().await.is_some();
         self.abort_all_tasks(TurnAbortReason::Interrupted).await;
         if !had_active_turn {
@@ -5840,3 +5867,7 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "world_state_item_tests.rs"]
 mod world_state_item_tests;
+
+#[cfg(test)]
+#[path = "workflow_outcome_tests.rs"]
+mod workflow_outcome_tests;

@@ -2815,6 +2815,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
+        "workflow",
     ] {
         assert!(
             v2.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
@@ -2926,11 +2927,38 @@ async fn multi_agent_v2_can_disable_wait_agent() {
             "list_agents".to_string(),
             "send_message".to_string(),
             "spawn_agent".to_string(),
+            "workflow".to_string(),
         ]
     );
     plan.assert_visible_lacks(&["clock"]);
     plan.assert_registered_lacks(&["collaboration.wait_agent", "clock.sleep"]);
     assert!(plan.can_manage_children);
+}
+
+#[tokio::test]
+async fn workflow_requires_its_feature_and_native_v2_tools() {
+    let workflow_name = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "workflow").to_string();
+    for (multi_agent_v2, workflow_enabled, disable_native_tools, expected) in [
+        (true, true, false, true),
+        (false, true, false, false),
+        (true, false, false, false),
+        (true, true, true, false),
+    ] {
+        let plan = probe(|turn| {
+            set_feature(turn, Feature::MultiAgentV2, multi_agent_v2);
+            set_feature(turn, Feature::WorkflowOrchestration, workflow_enabled);
+            update_config(turn, |config| {
+                config.multi_agent_v2.disable_native_tools = disable_native_tools;
+            });
+        })
+        .await;
+
+        if expected {
+            plan.assert_registered_contains(&[&workflow_name]);
+        } else {
+            plan.assert_registered_lacks(&[&workflow_name, "workflow"]);
+        }
+    }
 }
 
 #[tokio::test]
@@ -3032,6 +3060,7 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
+        "workflow",
     ] {
         namespaced.assert_visible_lacks(&[tool_name]);
         assert!(
@@ -3118,13 +3147,18 @@ async fn multi_agent_v2_bedrock_workers_only_delegate_when_model_supports_v2() {
 
         let spawn_agent_name = ToolName::namespaced("agents", "spawn_agent").to_string();
         let followup_task_name = ToolName::namespaced("agents", "followup_task").to_string();
+        let workflow_name = ToolName::namespaced("agents", "workflow").to_string();
         assert_eq!(plan.can_manage_children, supports_delegation);
         if supports_delegation {
             plan.assert_visible_contains(&["agents"]);
-            plan.assert_registered_contains(&[&spawn_agent_name, &followup_task_name]);
+            plan.assert_registered_contains(&[
+                &spawn_agent_name,
+                &followup_task_name,
+                &workflow_name,
+            ]);
         } else {
             plan.assert_visible_lacks(&["agents"]);
-            plan.assert_registered_lacks(&[&spawn_agent_name, &followup_task_name]);
+            plan.assert_registered_lacks(&[&spawn_agent_name, &followup_task_name, &workflow_name]);
         }
     }
 }
@@ -3172,6 +3206,7 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
+        "workflow",
     ] {
         assert!(
             plan.namespace_function_names("agents")

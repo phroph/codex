@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::session::Session;
 use super::step_context::StepContext;
 use crate::connectors;
+use crate::context::MultiAgentRoleInstructions;
 use crate::context::TokenBudgetContext;
 use crate::context::world_state::AgentsMdState;
 use crate::context::world_state::AppsInstructionsState;
@@ -39,6 +40,32 @@ use codex_tools::ToolName;
 
 const MAX_ENVIRONMENT_SUBAGENTS: usize = 8;
 const MAX_ENVIRONMENT_SUBAGENT_BYTES: usize = 1_024;
+
+const WORKFLOW_ORCHESTRATION_GUIDANCE: &str = r#"Native workflow orchestration is available through `workflow`. Respect the current multi-agent mode and the user's scope. For complex, multifactor work that benefits from coordinated delegation, create a task-specific workflow with groups, focused task prompts, and explicit dependencies. Keep simple or tightly coupled work direct. Choose roles and verification steps for the actual task; no fixed investigator, verifier, or critic stages are required.
+
+The runtime runs ready tasks and supplies dependency results to dependent workers. Use status or wait to inspect progress, and revise the workflow when findings change the useful next work. Prefer one coordinator unless a group genuinely benefits from its own decomposition. Do not manually relay every report or duplicate the runtime's dependency scheduling.
+
+A completed worker has submitted a report, not established its claims as verified truth. Inspect the evidence for load-bearing claims and reconcile material omissions before drawing conclusions. State specific uncertainty when it affects the decision, and choose the next useful action; do not manufacture caveats, compulsory caveat sections, or blockers merely because uncertainty exists."#;
+
+fn with_workflow_guidance(
+    instructions: Option<MultiAgentRoleInstructions>,
+    workflow_available: bool,
+) -> Option<MultiAgentRoleInstructions> {
+    if !workflow_available {
+        return instructions;
+    }
+    let mut instructions =
+        instructions.unwrap_or_else(|| MultiAgentRoleInstructions::Configured(String::new()));
+    let text = match &mut instructions {
+        MultiAgentRoleInstructions::Configured(text)
+        | MultiAgentRoleInstructions::Composed { base: text, .. } => text,
+    };
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(WORKFLOW_ORCHESTRATION_GUIDANCE);
+    Some(instructions)
+}
 
 impl Session {
     pub(crate) async fn current_window_uses_incremental_tools(
@@ -387,7 +414,15 @@ impl Session {
             super::multi_agents::effective_multi_agent_mode(step_context),
         )
         .with_namespace(v2_namespace.clone());
-        if let Some(usage_hint_text) = super::multi_agents::usage_hint_text(step_context) {
+        let workflow_available = turn_context.multi_agent_version == MultiAgentVersion::V2
+            && step_context.tool_router.exposes_tool(&ToolName::new(
+                turn_context.config.multi_agent_v2.tool_namespace.clone(),
+                "workflow",
+            ));
+        if let Some(usage_hint_text) = with_workflow_guidance(
+            super::multi_agents::usage_hint_text(step_context),
+            workflow_available,
+        ) {
             let usage_hint =
                 MultiAgentUsageHintState::new(usage_hint_text).with_namespace(v2_namespace.clone());
             multi_agent_mode = multi_agent_mode.with_usage_hint(&usage_hint);
@@ -444,5 +479,64 @@ impl Session {
             ));
         }
         Ok(world_state)
+    }
+}
+
+#[cfg(test)]
+mod workflow_guidance_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_workflow_does_not_change_role_instructions() {
+        assert_eq!(with_workflow_guidance(None, false), None);
+        let instructions = MultiAgentRoleInstructions::Configured("Configured role".to_string());
+        assert_eq!(
+            with_workflow_guidance(Some(instructions.clone()), false),
+            Some(instructions)
+        );
+    }
+
+    #[test]
+    fn available_workflow_survives_configured_and_suppressed_roles() {
+        assert_eq!(
+            with_workflow_guidance(None, true),
+            Some(MultiAgentRoleInstructions::Configured(
+                WORKFLOW_ORCHESTRATION_GUIDANCE.to_string()
+            ))
+        );
+        assert_eq!(
+            with_workflow_guidance(
+                Some(MultiAgentRoleInstructions::Configured(
+                    "Configured role".to_string()
+                )),
+                true,
+            ),
+            Some(MultiAgentRoleInstructions::Configured(format!(
+                "Configured role\n\n{WORKFLOW_ORCHESTRATION_GUIDANCE}"
+            )))
+        );
+    }
+
+    #[test]
+    fn available_workflow_preserves_catalog_role_capabilities() {
+        let instructions = MultiAgentRoleInstructions::Composed {
+            base: "Catalog role".to_string(),
+            marked: true,
+            omit_update_plan_instructions: true,
+            max_concurrency: 4,
+            wait_agent_enabled: false,
+            expose_model_overrides: true,
+        };
+        assert_eq!(
+            with_workflow_guidance(Some(instructions), true),
+            Some(MultiAgentRoleInstructions::Composed {
+                base: format!("Catalog role\n\n{WORKFLOW_ORCHESTRATION_GUIDANCE}"),
+                marked: true,
+                omit_update_plan_instructions: true,
+                max_concurrency: 4,
+                wait_agent_enabled: false,
+                expose_model_overrides: true,
+            })
+        );
     }
 }

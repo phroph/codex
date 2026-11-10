@@ -12,6 +12,7 @@ use crate::agent::api::AgentTurnOutcome;
 use crate::agent::api::DeliveryReceipt;
 use crate::agent::api::SendRequest;
 use crate::agent::api::SpawnRequest;
+use crate::agent::api::WorkflowAgentOutcome;
 use crate::agent::types::AgentExecutionGuard;
 use crate::agent::types::LiveAgent;
 use crate::agent::types::MessageDeliveryMode;
@@ -19,6 +20,9 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::GuardianRootSnapshot;
 use crate::codex_thread::ThreadConfigSnapshot;
+use crate::context::ContextualUserFragment;
+use crate::context::InternalContextSource;
+use crate::context::InternalModelContextFragment;
 use crate::rollout_budget::RolloutBudgetReminder;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
@@ -28,6 +32,10 @@ use codex_protocol::error::Result;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::turn_input::TurnInput;
+use codex_protocol::turn_input::TurnInputRequest;
+use codex_protocol::turn_input::TurnInputSubmission;
+use codex_protocol::turn_input::TurnStartOptions;
 use codex_rollout_trace::ThreadTraceContext;
 use futures::future::BoxFuture;
 use std::collections::HashSet;
@@ -186,6 +194,44 @@ impl AgentControl for LocalAgentControl {
         self.runtime.mailboxes.watch(agent)
     }
 
+    fn watch_workflow_outcomes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<WorkflowAgentOutcome>> {
+        Some(self.runtime.workflow_outcomes.subscribe())
+    }
+
+    fn workflow_attempt_is_running(&self, agent: ThreadId) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(self.workflow_attempt_has_live_work(agent))
+    }
+
+    fn continue_workflow_if_idle(
+        &self,
+        owner: ThreadId,
+        expected_previous_turn_id: String,
+        summary: String,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            self.runtime.ensure_agent_known(owner)?;
+            let thread = self.runtime.upgrade()?.get_thread(owner).await?;
+            let item = ContextualUserFragment::into(InternalModelContextFragment::new(
+                InternalContextSource::from_static("workflow"),
+                summary,
+            ));
+            let submission = thread
+                .continue_workflow_if_idle(
+                    TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(
+                        TurnStartOptions {
+                            turn_trigger: Some("workflow".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    expected_previous_turn_id,
+                )
+                .await?;
+            Ok(matches!(submission, TurnInputSubmission::Started { .. }))
+        })
+    }
+
     fn ensure_child_loaded(&self, parent: ThreadId, child: ThreadId) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let parent = self.runtime.upgrade()?.get_thread(parent).await?;
@@ -291,7 +337,11 @@ impl AgentControl for LocalAgentControl {
         outcome: AgentTurnOutcome,
         trace: &'a ThreadTraceContext,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(self.notify_parent_of_terminal_turn(outcome, trace))
+        Box::pin(async move {
+            self.runtime
+                .publish_workflow_outcome(WorkflowAgentOutcome::from(&outcome));
+            self.notify_parent_of_terminal_turn(outcome, trace).await;
+        })
     }
 
     fn service_tier(&self) -> Option<String> {

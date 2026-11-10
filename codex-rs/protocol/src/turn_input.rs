@@ -196,7 +196,11 @@ pub enum TurnInputMode {
     StartIfIdle,
     /// Start an internal continuation when idle.
     /// Reject if another task has started since the expected previous turn.
-    ContinueIfIdle { expected_previous_turn_id: String },
+    ContinueIfIdle {
+        expected_previous_turn_id: String,
+        /// Workflow continuations must not revive explicitly stopped work.
+        reject_interrupted: bool,
+    },
     /// Steer only if this exact turn is active.
     Steer { expected_turn_id: String },
 }

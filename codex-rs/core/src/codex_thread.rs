@@ -528,6 +528,22 @@ impl CodexThread {
             request,
             TurnInputMode::ContinueIfIdle {
                 expected_previous_turn_id,
+                reject_interrupted: false,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn continue_workflow_if_idle(
+        &self,
+        request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+        expected_previous_turn_id: String,
+    ) -> CodexResult<TurnInputSubmission> {
+        self.submit_turn_input_with_mode(
+            request,
+            TurnInputMode::ContinueIfIdle {
+                expected_previous_turn_id,
+                reject_interrupted: true,
             },
         )
         .await

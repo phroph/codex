@@ -72,6 +72,12 @@ enum TurnStartKind {
     Recovery,
 }
 
+/// Retains the reservation and lineage that authorized one workflow continuation.
+pub(crate) struct WorkflowContinuationAdmission {
+    pub(crate) previous_turn_id: String,
+    pub(crate) reservation: Arc<tokio::sync::Mutex<TurnState>>,
+}
+
 impl TurnStartKind {
     fn permits_mode(self, mode: ModeKind) -> bool {
         match self {
@@ -268,11 +274,13 @@ pub(super) async fn handle(
                 submission_id,
                 kind,
                 /*expected_previous_turn_id*/ None,
+                /*reject_interrupted*/ false,
             )
             .await
         }
         TurnInputMode::ContinueIfIdle {
             expected_previous_turn_id,
+            reject_interrupted,
         } => {
             if !matches!(
                 &request.request.input,
@@ -288,6 +296,7 @@ pub(super) async fn handle(
                 submission_id,
                 TurnStartKind::Recovery,
                 Some(expected_previous_turn_id),
+                reject_interrupted,
             )
             .await
         }
@@ -333,6 +342,7 @@ pub(super) async fn handle_recovery(
         submission_id,
         TurnStartKind::Recovery,
         /*expected_previous_turn_id*/ None,
+        /*reject_interrupted*/ false,
     )
     .await;
     if let Ok(TurnInputSubmission::Started { turn_id, .. }) = &result {
@@ -484,6 +494,7 @@ async fn start_if_idle(
     submission_id: String,
     kind: TurnStartKind,
     expected_previous_turn_id: Option<String>,
+    reject_interrupted: bool,
 ) -> CodexResult<TurnInputSubmission> {
     let WithTurnExtensionData {
         request,
@@ -541,8 +552,14 @@ async fn start_if_idle(
                 reason: NotSubmittedReason::NotIdle,
             });
         }
-        if let Some(expected) = expected_previous_turn_id
-            && session.state.lock().await.last_started_turn_id.as_ref() != Some(&expected)
+        let state = session.state.lock().await;
+        if (reject_interrupted
+            && (session.is_interrupted()
+                || state.shutting_down
+                || session.services.local_agent_runtime.shutdown.is_cancelled()))
+            || expected_previous_turn_id
+                .as_ref()
+                .is_some_and(|expected| state.last_started_turn_id.as_ref() != Some(expected))
         {
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::Superseded,
@@ -602,6 +619,14 @@ async fn start_if_idle(
     let mut task_input =
         merge_additional_context_input(session, &turn_context, additional_context).await;
     let sender_messages = capture_sender_user_messages(session, &mut input).await;
+    if reject_interrupted && let Some(previous_turn_id) = expected_previous_turn_id {
+        turn_context
+            .extension_data
+            .insert(WorkflowContinuationAdmission {
+                previous_turn_id,
+                reservation: Arc::clone(&turn_state),
+            });
+    }
     match kind {
         TurnStartKind::User => {
             session.clear_connector_selection().await;
@@ -641,6 +666,14 @@ async fn start_if_idle(
     session
         .start_task(Arc::clone(&turn_context), task_input, RegularTask::new())
         .await;
+    if reject_interrupted
+        && session.state.lock().await.last_started_turn_id.as_deref()
+            != Some(submission_id.as_str())
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded,
+        });
+    }
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
         root_turn_id: turn_context.root_turn_id(),

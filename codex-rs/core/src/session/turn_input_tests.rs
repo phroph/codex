@@ -77,6 +77,68 @@ fn user_message(text: &str) -> ResponseItem {
     }
 }
 
+#[tokio::test]
+async fn workflow_continuation_rejects_stopped_or_superseded_owner() {
+    for condition in ["interrupted", "shutdown", "tree_shutdown", "superseded"] {
+        let (session, _turn) = make_session_and_context().await;
+        let session = Arc::new(session);
+        session.state.lock().await.last_started_turn_id = Some("prior-turn".into());
+        match condition {
+            "interrupted" => session.mark_interrupted(),
+            "shutdown" => session.state.lock().await.shutting_down = true,
+            "tree_shutdown" => session.services.local_agent_runtime.shutdown.cancel(),
+            _ => session.state.lock().await.last_started_turn_id = Some("newer-turn".into()),
+        }
+        let result = handle(
+            &session,
+            TurnInputRequest::new(SubmittedTurnInput::ResponseItem(user_message(
+                "workflow result",
+            ))),
+            TurnInputMode::ContinueIfIdle {
+                expected_previous_turn_id: "prior-turn".into(),
+                reject_interrupted: true,
+            },
+            "continuation".into(),
+        )
+        .await
+        .expect("valid continuation input");
+        assert_eq!(
+            result,
+            TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::Superseded,
+            },
+            "{condition}"
+        );
+        assert!(session.active_turn.lock().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_rechecks_lineage_before_task_registration() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let reservation = ActiveTurn::default();
+    turn.extension_data.insert(WorkflowContinuationAdmission {
+        previous_turn_id: "prior-turn".into(),
+        reservation: Arc::clone(&reservation.turn_state),
+    });
+    *session.active_turn.lock().await = Some(reservation);
+    // An explicit workflow stop invalidates this after initial idle admission.
+    session.state.lock().await.last_started_turn_id = None;
+    session
+        .start_task(
+            Arc::new(turn),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.state.lock().await.last_started_turn_id.is_none());
+}
+
 async fn submit_start_only(
     session: &Arc<Session>,
     input: SubmittedTurnInput,

@@ -76,6 +76,39 @@ pub trait AgentControl: Send + Sync {
     /// arrivals cannot be missed; notifications do not consume mail or start a turn.
     fn watch_mailbox(&self, agent: ThreadId) -> tokio::sync::watch::Receiver<bool>;
 
+    /// Observe terminal turns and shutdowns without consuming agent mail or starting work.
+    /// Subscribe before dispatching work. This bounded stream is not durable: callers must
+    /// reconcile lagged outcomes and deduplicate repeated thread/turn notifications.
+    fn watch_workflow_outcomes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<WorkflowAgentOutcome>> {
+        None
+    }
+
+    /// Check whether an attempt still has reserved, running, or draining native work.
+    /// Unlike AgentStatus, an interrupted snapshot must remain busy until teardown ends.
+    fn workflow_attempt_is_running(&self, _agent: ThreadId) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async {
+            Err(codex_protocol::error::CodexErr::UnsupportedOperation(
+                "This agent backend cannot inspect workflow attempt execution".to_string(),
+            ))
+        })
+    }
+
+    /// Continue an owned workflow only if its coordinator is still idle on the expected turn.
+    fn continue_workflow_if_idle(
+        &self,
+        _owner: ThreadId,
+        _expected_previous_turn_id: String,
+        _summary: String,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async {
+            Err(codex_protocol::error::CodexErr::UnsupportedOperation(
+                "This agent backend cannot continue workflows".to_string(),
+            ))
+        })
+    }
+
     /// Load a recorded V2 child through its live immediate parent, without sending input.
     /// Implementations validate ownership and restore the child under the parent's current
     /// authority. Success makes the child available for attachment through its thread manager.
@@ -241,6 +274,28 @@ pub struct AgentTurnOutcome {
     pub status: AgentStatus,
     /// Typed reason used to choose guidance in the parent notification.
     pub error_info: Option<CodexErrorInfo>,
+}
+
+/// A native lifecycle observation for workflow scheduling, not a task-success judgment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowAgentOutcome {
+    pub thread_id: ThreadId,
+    /// The native turn ID, or the shutdown submission ID for `AgentStatus::Shutdown`.
+    pub turn_id: String,
+    pub status: AgentStatus,
+    /// True only after the owner has released its active-turn reservation.
+    pub idle: bool,
+}
+
+impl From<&AgentTurnOutcome> for WorkflowAgentOutcome {
+    fn from(outcome: &AgentTurnOutcome) -> Self {
+        Self {
+            thread_id: outcome.thread_id,
+            turn_id: outcome.turn_id.clone(),
+            status: outcome.status.clone(),
+            idle: false,
+        }
+    }
 }
 
 /// Settings shared by the tree. A service tier of `None` restores the default tier.

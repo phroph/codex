@@ -61,19 +61,26 @@ impl Session {
     }
 
     pub(crate) async fn emit_thread_idle_lifecycle_if_idle(&self, cause: ThreadIdleCause) {
-        let cause = {
+        let (cause, workflow_outcome) = {
             let active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
                 return;
             }
-            if self.is_interrupted() {
+            let cause = if self.is_interrupted() {
                 ThreadIdleCause::Interrupted
             } else {
                 cause
-            }
+            };
+            (cause, self.workflow_idle_outcome().await)
         };
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             return;
+        }
+
+        if let Some(outcome) = workflow_outcome {
+            self.services
+                .local_agent_runtime
+                .publish_workflow_outcome(outcome);
         }
 
         for contributor in self.services.extensions.thread_lifecycle_contributors() {

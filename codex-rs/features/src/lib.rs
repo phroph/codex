@@ -242,6 +242,8 @@ pub enum Feature {
     Collab,
     /// Enable task-path-based multi-agent routing.
     MultiAgentV2,
+    /// Execute adaptive, task-specific workflows through the native multi-agent runtime.
+    WorkflowOrchestration,
     /// Keep spawn model choices in append-only context instead of tool descriptions.
     ModelCatalogInContext,
     /// Inherit client-defined dynamic tools in fresh V2 subagents.
@@ -1600,6 +1602,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "multi_agent_v2",
         stage: Stage::Stable,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WorkflowOrchestration,
+        key: "workflow_orchestration",
+        stage: Stage::Experimental {
+            name: "Workflow orchestration",
+            menu_description: "Coordinate complex work with adaptive groups and task dependencies.",
+            announcement: "",
+        },
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ModelCatalogInContext,

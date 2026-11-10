@@ -83,6 +83,7 @@ mod agent_communication;
 pub use agent_communication::PendingAgentMessage;
 mod agent_message_board;
 pub use agent_message_board::install_agent_message_board;
+pub(crate) mod workflow;
 mod attestation;
 mod code_mode_host;
 mod codex_delegate;

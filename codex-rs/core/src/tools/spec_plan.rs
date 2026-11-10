@@ -51,6 +51,7 @@ use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHand
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
+use crate::tools::handlers::workflow::WorkflowHandler;
 use crate::tools::hosted_spec::WebSearchToolOptions;
 use crate::tools::hosted_spec::create_web_search_tool;
 use crate::tools::multi_agent_tool::multi_agent_v2_handler;
@@ -1514,6 +1515,22 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 exposure,
                 native_review,
             );
+            if turn_context
+                .config
+                .features
+                .enabled(Feature::WorkflowOrchestration)
+            {
+                registry.register_trusted_with_native_review(
+                    multi_agent_v2_handler(
+                        WorkflowHandler::new(),
+                        tool_namespace,
+                        /*description_override*/ None,
+                        /*parameters_override*/ None,
+                    ),
+                    exposure,
+                    native_review,
+                );
+            }
             if !turn_context.config.multi_agent_v2.disable_direct_message {
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
