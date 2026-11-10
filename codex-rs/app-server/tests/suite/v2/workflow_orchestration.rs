@@ -10,6 +10,8 @@ use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
+use codex_app_server_protocol::TurnPlanStepStatus;
+use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
@@ -147,6 +149,30 @@ async fn worker(server: &MockServer, prompt: &'static str, output: &'static str)
         completed_response(prompt, output),
     )
     .await
+}
+
+async fn workflow_plan(
+    app_server: &mut TestAppServer,
+    thread_id: &str,
+    predicate: impl Fn(&TurnPlanUpdatedNotification) -> bool,
+) -> Result<TurnPlanUpdatedNotification> {
+    let notification = timeout(
+        READ_TIMEOUT,
+        app_server.read_stream_until_matching_notification(
+            "scheduler plan update",
+            |notification| {
+                notification.method == "turn/plan/updated"
+                    && notification.params.as_ref().is_some_and(|params| {
+                        serde_json::from_value::<TurnPlanUpdatedNotification>(params.clone())
+                            .is_ok_and(|plan| plan.thread_id == thread_id && predicate(&plan))
+                    })
+            },
+        ),
+    )
+    .await??;
+    Ok(serde_json::from_value(
+        notification.params.context("workflow plan params")?,
+    )?)
 }
 
 // ResponseMock records requests before later matchers run, so select this worker explicitly.
@@ -304,6 +330,47 @@ async fn workflow_dispatches_parallel_branches_and_supplies_dependency_results()
         "workflow guidance must survive the configured root role override"
     );
 
+    // No mock response calls update_plan: all these UI events come from the scheduler.
+    let pending = workflow_plan(&mut app_server, &root_thread_id, |plan| {
+        plan.plan.iter().any(|step| {
+            step.step.contains("combine:")
+                && step.step.contains("waiting for left-input, left_input")
+        })
+    })
+    .await?;
+    assert!(
+        pending
+            .plan
+            .iter()
+            .any(|step| step.step.contains("[evidence] left-input: measure input"))
+    );
+    assert!(
+        pending
+            .plan
+            .iter()
+            .all(|step| step.status == TurnPlanStepStatus::Pending)
+    );
+    workflow_plan(&mut app_server, &root_thread_id, |plan| {
+        plan.plan
+            .iter()
+            .any(|step| step.status == TurnPlanStepStatus::InProgress)
+    })
+    .await?;
+    let finished = workflow_plan(&mut app_server, &root_thread_id, |plan| {
+        plan.explanation
+            .as_deref()
+            .is_some_and(|text| text.contains("completed: 3/3 reports returned"))
+    })
+    .await?;
+    assert_eq!(finished.turn_id, pending.turn_id);
+    assert_eq!(finished.plan.len(), 3);
+    assert!(
+        finished
+            .plan
+            .iter()
+            .all(|step| step.status == TurnPlanStepStatus::Completed)
+    );
+
     let child_requests = [
         worker_request(&left, LEFT_PROMPT, &root_thread_id),
         worker_request(&right, RIGHT_PROMPT, &root_thread_id),
@@ -442,6 +509,20 @@ async fn completed_workflow_continues_idle_owner_once_with_saved_results() -> Re
     let completed: TurnCompletedNotification =
         serde_json::from_value(completed.params.context("continued completion params")?)?;
     assert_eq!(completed.turn.status, TurnStatus::Completed);
+
+    // Progress is retained for the original idle turn and republished when its
+    // coordinator reads the workflow from the automatically continued turn.
+    for turn_id in [&first.turn.id, &started.turn.id] {
+        let plan = workflow_plan(&mut app_server, &root_thread_id, |plan| {
+            &plan.turn_id == turn_id
+                && plan
+                    .explanation
+                    .as_deref()
+                    .is_some_and(|text| text.contains("completed: 1/1 reports returned"))
+        })
+        .await?;
+        assert_eq!(plan.plan[0].status, TurnPlanStepStatus::Completed);
+    }
 
     let requests = root_requests.lock().expect("root request log").clone();
     assert_eq!(requests.len(), 4);
@@ -638,6 +719,23 @@ async fn cancelling_workflow_interrupts_active_work_and_cancels_pending_dependen
     .await??;
     assert_eq!(settled["status"], "cancelled");
     assert_eq!(settled["tasks"]["dependent"]["status"], "cancelled");
+    let cancelled_plan = workflow_plan(&mut app_server, &root_thread_id, |plan| {
+        plan.explanation
+            .as_deref()
+            .is_some_and(|text| text.contains("— cancelled:"))
+            && plan
+                .plan
+                .iter()
+                .all(|step| step.step.contains("— cancelled"))
+    })
+    .await?;
+    assert_eq!(cancelled_plan.plan.len(), 2);
+    assert!(
+        cancelled_plan
+            .plan
+            .iter()
+            .all(|step| step.status == TurnPlanStepStatus::Pending)
+    );
     assert!(worker_requests(&dependent, DEPENDENT_PROMPT, &root_thread_id).is_empty());
     Ok(())
 }

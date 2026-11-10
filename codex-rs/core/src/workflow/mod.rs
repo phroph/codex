@@ -4,6 +4,7 @@
 //! handoff, interruption, and receipts; a completed worker is not an accepted conclusion.
 
 pub(crate) mod model;
+mod progress;
 pub(crate) mod store;
 
 use crate::agent::api::AgentControl;
@@ -80,6 +81,7 @@ pub(crate) struct WorkflowArgs {
 struct WorkflowManager {
     handles: Mutex<BTreeMap<String, WorkflowHandle>>,
     initialization: Mutex<()>,
+    progress: Mutex<Option<(String, Value)>>,
 }
 
 #[derive(Clone)]
@@ -397,6 +399,7 @@ pub(crate) async fn execute(
         Ordering::Release,
     );
     handle.owner_turn.send_replace(step.turn.sub_id.clone());
+    progress::publish(&session, &step.turn.sub_id).await;
     Ok(view(&state, &handle.directory, args.include_outputs))
 }
 
@@ -539,6 +542,7 @@ fn task_prompt(state: &WorkflowState, id: &str, directory: &std::path::Path) -> 
 
 impl WorkflowActor {
     async fn run(mut self) {
+        self.publish_progress().await;
         loop {
             if self.stop_requested.load(Ordering::Acquire) && !self.stop_handled {
                 self.stop_handled = true;
@@ -617,7 +621,15 @@ impl WorkflowActor {
         self.store.save(&mut next, event).await?;
         self.state = next;
         self.changed.send_replace(self.state.clone());
+        self.publish_progress().await;
         Ok(())
+    }
+
+    async fn publish_progress(&self) {
+        if let Some(owner) = self.owner.upgrade() {
+            let turn_id = self.owner_turn.borrow().clone();
+            progress::publish(&owner, &turn_id).await;
+        }
     }
 
     async fn fail_runtime(&mut self, error: String) {
@@ -625,6 +637,7 @@ impl WorkflowActor {
         self.state.status = RunStatus::NeedsAttention;
         self.state.last_error = Some(error);
         self.changed.send_replace(self.state.clone());
+        self.publish_progress().await;
         self.notify_owner().await;
         self.maybe_continue_owner().await;
     }
@@ -951,6 +964,7 @@ impl WorkflowActor {
         if saved.is_err() {
             self.state = next;
             self.changed.send_replace(self.state.clone());
+            self.publish_progress().await;
         }
         let mut failures = Vec::new();
         for id in active {
