@@ -243,6 +243,27 @@ impl RetainedContext {
         self.sender_deliveries.back().map(|entry| &entry.value)
     }
 
+    /// Original local human messages accepted after the latest sender delivery.
+    /// Historical sender restrictions remain separate evidence; transcript copies
+    /// must not make these later originals disappear from host-owned context.
+    pub fn local_user_messages_after_sender(
+        &self,
+    ) -> impl Iterator<Item = (u64, &RetainedUserMessage)> {
+        let delivery_order = self.sender_deliveries.back().map(|entry| entry.order);
+        let mut messages = self
+            .user_messages
+            .iter()
+            .filter(|entry| {
+                !entry.inherited
+                    && entry.value.origin == crate::UserInputOrigin::User
+                    && delivery_order.is_some_and(|order| entry.order > order)
+            })
+            .map(|entry| (entry.order, &entry.value))
+            .collect::<Vec<_>>();
+        messages.sort_by_key(|(order, _)| *order);
+        messages.into_iter()
+    }
+
     /// Retains host metadata with the delivery's acceptance order, including during replay.
     pub fn record_sender_user_messages(&mut self, metadata: &CodexHarnessMetadata) -> bool {
         let Some(messages) = metadata.sender_user_messages.as_deref() else {

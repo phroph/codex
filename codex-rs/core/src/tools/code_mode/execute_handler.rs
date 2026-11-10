@@ -77,6 +77,13 @@ impl CodeModeExecuteHandler {
         .map_err(|error| FunctionCallError::Fatal(error.to_string()))?
         .apply_code_mode(&mut enabled_tools);
         let started_at = std::time::Instant::now();
+        // Only borrow the initial outer observation's existing
+        // budget. Background and interactive sessions retain their normal yields.
+        let implicit_exec_deadline =
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(
+                args.yield_time_ms
+                    .unwrap_or(exec.turn.config.code_mode.default_exec_yield_time_ms),
+            ));
         let started_cell = exec
             .session
             .services
@@ -123,7 +130,7 @@ impl CodeModeExecuteHandler {
         exec.session
             .services
             .code_mode_service
-            .mark_cell_ready_for_dispatch(&cell_id, originating_call);
+            .mark_cell_ready_for_dispatch(&cell_id, originating_call, implicit_exec_deadline);
         let response = started_cell
             .initial_response()
             .await

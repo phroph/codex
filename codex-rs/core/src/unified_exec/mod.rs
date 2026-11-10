@@ -85,6 +85,7 @@ pub(crate) struct UnifiedExecContext {
     pub step_context: Arc<StepContext>,
     pub cancellation_token: CancellationToken,
     pub call_id: String,
+    pub implicit_yield_deadline: Option<tokio::time::Instant>,
 }
 
 impl UnifiedExecContext {
@@ -99,6 +100,7 @@ impl UnifiedExecContext {
             step_context,
             cancellation_token,
             call_id,
+            implicit_yield_deadline: None,
         }
     }
 }

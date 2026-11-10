@@ -143,6 +143,7 @@ impl ExecCommandHandler {
             tracker,
             call_id,
             payload,
+            source,
             ..
         } = invocation;
 
@@ -156,7 +157,7 @@ impl ExecCommandHandler {
         };
 
         let manager: &UnifiedExecProcessManager = &session.services.unified_exec_manager;
-        let context = UnifiedExecContext::new(
+        let mut context = UnifiedExecContext::new(
             session.clone(),
             step_context.clone(),
             cancellation_token,
@@ -174,7 +175,18 @@ impl ExecCommandHandler {
             &turn_environment.selection.environment_id,
         )
         .await;
+        let coalesce_foreground_wait = !parsed.args.background && parsed.args.timeout_ms.is_none();
         let prepared = parsed.prepare(self.lifetime)?;
+        if coalesce_foreground_wait
+            && prepared.completion_timeout.is_none()
+            && !prepared.tty
+            && let crate::tools::context::ToolCallSource::CodeMode { cell_id, .. } = source
+        {
+            context.implicit_yield_deadline = session
+                .services
+                .code_mode_service
+                .cell_implicit_exec_deadline(&codex_code_mode::CellId::new(cell_id));
+        }
         let max_output_tokens = prepared.max_output_tokens;
         let fs = prepared.turn_environment.environment.get_filesystem();
         let intercepted_patch = intercept_apply_patch(

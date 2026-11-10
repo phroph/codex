@@ -139,7 +139,9 @@ async fn detached_code_mode_callback_keeps_thread_id_on_dispatch_span() -> anyho
         /*executed_tool_calls*/ Default::default(),
     ));
     let cell_id = CellId::new("audit-cell".to_string());
-    broker.mark_cell_ready_for_dispatch(&cell_id, /*originating_call*/ None);
+    broker.mark_cell_ready_for_dispatch(
+        &cell_id, /*originating_call*/ None, /*implicit_exec_deadline*/ None,
+    );
     let records = DispatchRecords::default();
     let router_parents = RouterParents::default();
     let subscriber = tracing_subscriber::registry().with(DispatchCapture {
@@ -246,7 +248,9 @@ async fn dropped_tool_callbacks_release_the_origin_before_dispatch() {
     };
     *queued_response = response_tx;
     broker.dispatch_tx.send(message).await.unwrap();
-    broker.mark_cell_ready_for_dispatch(&cell_id, /*originating_call*/ None);
+    broker.mark_cell_ready_for_dispatch(
+        &cell_id, /*originating_call*/ None, /*implicit_exec_deadline*/ None,
+    );
     let _worker = broker.start_turn_worker(
         Arc::clone(&session),
         StepContext::for_test(Arc::clone(&turn)),

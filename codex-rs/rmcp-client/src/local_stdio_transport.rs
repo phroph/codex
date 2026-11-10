@@ -18,7 +18,14 @@ use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
 use rmcp::transport::async_rw::AsyncRwTransport;
 use tokio::io::AsyncRead;
-use tokio::process::ChildStderr;
+#[cfg(windows)]
+pub(super) type LocalChildStdout = tokio::net::windows::named_pipe::NamedPipeServer;
+#[cfg(windows)]
+pub(super) type LocalChildStderr = tokio::net::windows::named_pipe::NamedPipeServer;
+#[cfg(not(windows))]
+pub(super) type LocalChildStdout = tokio::process::ChildStdout;
+#[cfg(not(windows))]
+pub(super) type LocalChildStderr = tokio::process::ChildStderr;
 use tokio::process::ChildStdin;
 use tokio::sync::oneshot;
 
@@ -149,15 +156,19 @@ impl LocalStdioTransport {
         mut child: Child,
         program_name: String,
         protocol_mode: McpProtocolMode,
-    ) -> io::Result<(Self, Option<ChildStderr>)> {
+        #[cfg(windows)] stdout: LocalChildStdout,
+        #[cfg(windows)] stderr: Option<LocalChildStderr>,
+    ) -> io::Result<(Self, Option<LocalChildStderr>)> {
         let stdin = child
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("MCP server stdin was not piped"))?;
+        #[cfg(not(windows))]
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("MCP server stdout was not piped"))?;
+        #[cfg(not(windows))]
         let stderr = child.stderr.take();
         let transport = match protocol_mode {
             McpProtocolMode::Legacy => {

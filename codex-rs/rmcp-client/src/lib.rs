@@ -37,6 +37,8 @@ mod tool_list_changes;
 mod trace_context;
 mod user_verification;
 mod utils;
+#[cfg(windows)]
+mod windows_stdio;
 mod www_authenticate;
 
 pub use auth_status::McpAuthState;

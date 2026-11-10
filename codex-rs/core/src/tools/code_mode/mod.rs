@@ -206,9 +206,20 @@ impl CodeModeService {
         &self,
         cell_id: &codex_code_mode::CellId,
         originating_call: Option<crate::tools::context::ToolCallOrigin>,
+        implicit_exec_deadline: Option<tokio::time::Instant>,
     ) {
-        self.dispatch_broker
-            .mark_cell_ready_for_dispatch(cell_id, originating_call);
+        self.dispatch_broker.mark_cell_ready_for_dispatch(
+            cell_id,
+            originating_call,
+            implicit_exec_deadline,
+        );
+    }
+
+    pub(crate) fn cell_implicit_exec_deadline(
+        &self,
+        cell_id: &CellId,
+    ) -> Option<tokio::time::Instant> {
+        self.dispatch_broker.cell_implicit_exec_deadline(cell_id)
     }
 
     pub(crate) fn cell_originating_call(

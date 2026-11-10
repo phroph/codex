@@ -65,6 +65,8 @@ pub(crate) fn terminal_session_for_input(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExecCommandArgs {
+    #[serde(default)]
+    background: bool,
     pub(crate) cmd: String,
     #[serde(default)]
     shell: Option<String>,

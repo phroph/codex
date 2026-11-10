@@ -108,6 +108,7 @@ mod model_provider_capabilities_read;
 #[path = "model_provider_enforcement_tests.rs"]
 mod model_provider_enforcement;
 mod multi_agent_v2_developer_instructions;
+mod nested_exec_wait_experiment;
 mod otel;
 mod output_schema;
 mod permission_profile_list;

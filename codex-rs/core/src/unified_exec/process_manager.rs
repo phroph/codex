@@ -659,12 +659,24 @@ impl UnifiedExecProcessManager {
         let deadline = start
             .checked_add(wait)
             .ok_or_else(|| UnifiedExecError::process_failed("timeout_ms is too large".into()))?;
+        let observation_deadline = context
+            .implicit_yield_deadline
+            .map_or(deadline, |outer_deadline| deadline.max(outer_deadline));
         let collected_output = Self::collect_output_until_deadline(
             process.output_handles(),
             Some(context.session.subscribe_elicitation_pause_state()),
-            deadline,
+            observation_deadline,
         )
         .await;
+        if observation_deadline > deadline && Instant::now() >= deadline {
+            tracing::info!(
+                target: "codex_core::nested_exec_wait_experiment",
+                conversation_id = %context.session.thread_id,
+                call_id = %context.call_id,
+                process_id = request.process_id,
+                "coalesced one implicit nested exec yield"
+            );
+        }
         if let Some(completion) = completion.as_mut()
             && !process.has_exited()
         {

@@ -60,6 +60,13 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         ),
     ]);
     properties.insert(
+        "background".to_string(),
+        JsonSchema::boolean(Some(
+            "True preserves an early session return for servers, watchers, or commands deliberately run in the background. False or omitted means completion is needed. In Code Mode, foreground commands may wait within the outer execution budget even with an explicit yield_time_ms; TTY sessions and explicit timeouts retain their existing behavior."
+                .to_string(),
+        )),
+    );
+    properties.insert(
         "shell".to_string(),
         JsonSchema::string(Some(
             "Shell binary to launch. Defaults to the user's default shell.".to_string(),

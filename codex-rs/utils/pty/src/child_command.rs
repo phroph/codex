@@ -186,6 +186,20 @@ impl Command {
         self
     }
 
+    /// Supply the child end of a Windows output pipe before spawning.
+    #[cfg(windows)]
+    pub fn stdout_handle(&mut self, handle: std::os::windows::io::OwnedHandle) -> &mut Self {
+        self.inner.stdout(TokioStdio::from(handle));
+        self
+    }
+
+    /// Supply the child end of a Windows diagnostic pipe before spawning.
+    #[cfg(windows)]
+    pub fn stderr_handle(&mut self, handle: std::os::windows::io::OwnedHandle) -> &mut Self {
+        self.inner.stderr(TokioStdio::from(handle));
+        self
+    }
+
     pub fn descriptor_policy(&mut self, policy: DescriptorPolicy) -> &mut Self {
         self.descriptor_policy = policy;
         self

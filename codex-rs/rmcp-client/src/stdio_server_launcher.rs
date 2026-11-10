@@ -503,26 +503,41 @@ impl LocalStdioServerLauncher {
                 "MCP client is shut down",
             ));
         }
+        #[cfg(windows)]
+        let spawn_with_output = |mut command: Command| -> io::Result<_> {
+            let (stdout, stdout_handle) = crate::windows_stdio::output_pipe()?;
+            let (stderr, stderr_handle) = crate::windows_stdio::output_pipe()?;
+            command
+                .stdout_handle(stdout_handle)
+                .stderr_handle(stderr_handle);
+            Ok((command.spawn()?, stdout, Some(stderr)))
+        };
+        #[cfg(windows)]
+        let (child, stdout, stderr) = spawn_with_output(command)?;
+        #[cfg(not(windows))]
         let child = command.spawn()?;
         #[cfg(windows)]
-        let (child, job) = match job {
+        let (child, stdout, stderr, job) = match job {
             Some(job) => match child
                 .id()
                 .ok_or_else(|| io::Error::other("missing suspended MCP server process id"))
                 .and_then(|process_id| job.assign_and_resume_process(process_id))
             {
-                Ok(Some(root)) => (child, Some((job, root))),
-                Ok(None) => (child, None),
+                Ok(Some(root)) => (child, stdout, stderr, Some((job, root))),
+                Ok(None) => (child, stdout, stderr, None),
                 Err(error) => {
                     warn!(
                         "Windows MCP process job containment failed; retrying without it: {error}"
                     );
                     drop(child);
                     drop(job);
-                    (build_command().spawn()?, None)
+                    drop(stdout);
+                    drop(stderr);
+                    let (child, stdout, stderr) = spawn_with_output(build_command())?;
+                    (child, stdout, stderr, None)
                 }
             },
-            None => (child, None),
+            None => (child, stdout, stderr, None),
         };
         #[cfg(windows)]
         let protocol_mode = if job.is_none() && protocol_mode == McpProtocolMode::DiscoverLocalStdio
@@ -537,8 +552,15 @@ impl LocalStdioServerLauncher {
         let discovery_owned = (protocol_mode == McpProtocolMode::DiscoverLocalStdio
             || replacement_slot.is_some())
             && process_id.is_some();
-        let (transport, stderr) =
-            LocalStdioTransport::new(child, program_name.clone(), protocol_mode)?;
+        let (transport, stderr) = LocalStdioTransport::new(
+            child,
+            program_name.clone(),
+            protocol_mode,
+            #[cfg(windows)]
+            stdout,
+            #[cfg(windows)]
+            stderr,
+        )?;
         #[cfg(windows)]
         let terminator = match job {
             Some((job, root)) => Some(LocalProcessTerminator::Job {

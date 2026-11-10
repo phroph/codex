@@ -49,6 +49,7 @@ pub(super) struct CodeModeCellDelegate {
 
 struct CellDispatchGate {
     ready: watch::Sender<bool>,
+    implicit_exec_deadline: Option<tokio::time::Instant>,
     // Callbacks may create the gate before exec attaches its origin. None means
     // no origin is attached; Some retains the original item and window across
     // waits, even if the best-effort item lookup found no ID.
@@ -71,6 +72,7 @@ impl CodeModeDispatchBroker {
         &self,
         cell_id: &CellId,
         originating_call: Option<ToolCallOrigin>,
+        implicit_exec_deadline: Option<tokio::time::Instant>,
     ) {
         let ready = {
             let mut dispatch_gates = self
@@ -82,11 +84,24 @@ impl CodeModeDispatchBroker {
                 .or_insert_with(|| CellDispatchGate {
                     ready: watch::channel(false).0,
                     originating_call: None,
+                    implicit_exec_deadline: None,
                 });
             gate.originating_call = originating_call;
+            gate.implicit_exec_deadline = implicit_exec_deadline;
             gate.ready.clone()
         };
         ready.send_replace(true);
+    }
+
+    pub(super) fn cell_implicit_exec_deadline(
+        &self,
+        cell_id: &CellId,
+    ) -> Option<tokio::time::Instant> {
+        self.dispatch_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(cell_id)
+            .and_then(|gate| gate.implicit_exec_deadline)
     }
 
     pub(super) fn cell_originating_call(&self, cell_id: &CellId) -> Option<ToolCallOrigin> {
@@ -261,6 +276,7 @@ fn dispatch_gate(
         .or_insert_with(|| CellDispatchGate {
             ready: watch::channel(false).0,
             originating_call: None,
+            implicit_exec_deadline: None,
         })
         .ready
         .clone()
