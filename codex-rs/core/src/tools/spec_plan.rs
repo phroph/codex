@@ -51,6 +51,7 @@ use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHand
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
+use crate::tools::handlers::workflow::WORKFLOW_TOOL_NAMESPACE;
 use crate::tools::handlers::workflow::WorkflowHandler;
 use crate::tools::hosted_spec::WebSearchToolOptions;
 use crate::tools::hosted_spec::create_web_search_tool;
@@ -1523,7 +1524,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(
                         WorkflowHandler::new(),
-                        tool_namespace,
+                        Some(WORKFLOW_TOOL_NAMESPACE),
                         /*description_override*/ None,
                         /*parameters_override*/ None,
                     ),

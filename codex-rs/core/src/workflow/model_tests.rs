@@ -12,6 +12,9 @@ fn task(id: &str, dependencies: &[&str]) -> TaskSpec {
         model: None,
         reasoning_effort: None,
         inherit_context: false,
+        kind: TaskKind::Work,
+        deliverable: None,
+        inputs: Vec::new(),
     }
 }
 

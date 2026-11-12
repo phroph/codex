@@ -844,6 +844,7 @@ impl LocalAgentControl {
             turn_trigger: options.turn_trigger,
             root_turn_id: options.root_turn_id,
             cyber_access_program: options.cyber_access_program,
+            final_output_json_schema: options.final_output_json_schema,
             ..Default::default()
         };
         let input_admission_started_at = Instant::now();

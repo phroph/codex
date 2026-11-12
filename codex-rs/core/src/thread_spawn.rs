@@ -206,6 +206,7 @@ pub(crate) async fn prepare(
                 disabled_plugin_ids: Some(turn.disabled_plugin_ids.clone()),
                 multi_agent_v2_usage_hints,
                 cyber_access_program: turn.cyber_access_program,
+                final_output_json_schema: None,
             },
         },
         task_name,

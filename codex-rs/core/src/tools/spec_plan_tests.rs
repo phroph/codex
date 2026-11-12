@@ -36,6 +36,7 @@ use codex_tools::ToolExposure;
 use codex_tools::ToolName;
 use codex_tools::ToolOutput;
 use codex_tools::ToolSpec;
+use codex_tools::create_tools_json_for_responses_lite;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -2815,7 +2816,6 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
-        "workflow",
     ] {
         assert!(
             v2.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
@@ -2875,6 +2875,11 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "spawn_agent").to_string()),
         ToolExposure::DirectModelOnly
     );
+    direct_model_only.assert_visible_contains(&["workflows"]);
+    assert_eq!(
+        direct_model_only.exposure(&ToolName::namespaced("workflows", "workflow").to_string()),
+        ToolExposure::DirectModelOnly
+    );
 }
 
 #[tokio::test]
@@ -2927,7 +2932,6 @@ async fn multi_agent_v2_can_disable_wait_agent() {
             "list_agents".to_string(),
             "send_message".to_string(),
             "spawn_agent".to_string(),
-            "workflow".to_string(),
         ]
     );
     plan.assert_visible_lacks(&["clock"]);
@@ -2937,7 +2941,7 @@ async fn multi_agent_v2_can_disable_wait_agent() {
 
 #[tokio::test]
 async fn workflow_requires_its_feature_and_native_v2_tools() {
-    let workflow_name = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "workflow").to_string();
+    let workflow_name = ToolName::namespaced("workflows", "workflow").to_string();
     for (multi_agent_v2, workflow_enabled, disable_native_tools, expected) in [
         (true, true, false, true),
         (false, true, false, false),
@@ -2958,6 +2962,57 @@ async fn workflow_requires_its_feature_and_native_v2_tools() {
         } else {
             plan.assert_registered_lacks(&[&workflow_name, "workflow"]);
         }
+    }
+}
+
+#[tokio::test]
+async fn workflow_namespace_is_independent_of_reserved_multi_agent_namespace() {
+    for configured_namespace in [None, Some("agents")] {
+        let plan = probe(|turn| {
+            set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+            set_feature(turn, Feature::WorkflowOrchestration, /*enabled*/ true);
+            update_config(turn, |config| {
+                if let Some(namespace) = configured_namespace {
+                    config.multi_agent_v2.tool_namespace = Some(namespace.to_string());
+                }
+            });
+        })
+        .await;
+
+        let agent_namespace = configured_namespace.unwrap_or(MULTI_AGENT_V2_NAMESPACE);
+        plan.assert_registered_contains(&[
+            &ToolName::namespaced("workflows", "workflow").to_string(),
+            &ToolName::namespaced(agent_namespace, "spawn_agent").to_string(),
+        ]);
+        plan.assert_registered_lacks(&[
+            &ToolName::namespaced("collaboration", "workflow").to_string(),
+            &ToolName::namespaced("agents", "workflow").to_string(),
+            "workflow",
+        ]);
+        assert_eq!(
+            plan.namespace_function_names("workflows"),
+            &["workflow".to_string()]
+        );
+        assert!(
+            !plan
+                .namespace_function_names(agent_namespace)
+                .iter()
+                .any(|name| name == "workflow")
+        );
+
+        // Exercise the serializer used for actual additional_tools requests too:
+        // mock model responses do not enforce the service's reserved namespace rules.
+        let declarations = create_tools_json_for_responses_lite(&plan.visible_specs).unwrap();
+        let workflow_namespaces = declarations
+            .iter()
+            .filter(|namespace| {
+                namespace["tools"]
+                    .as_array()
+                    .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "workflow"))
+            })
+            .map(|namespace| namespace["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(workflow_namespaces, vec!["workflows"]);
     }
 }
 
@@ -3060,7 +3115,6 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
-        "workflow",
     ] {
         namespaced.assert_visible_lacks(&[tool_name]);
         assert!(
@@ -3083,6 +3137,14 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
             "expected {tool_name} in agents namespace"
         );
     }
+    assert_eq!(
+        namespaced.namespace_function_names("workflows"),
+        &["workflow".to_string()]
+    );
+    assert_eq!(
+        namespaced.exposure(&ToolName::namespaced("workflows", "workflow").to_string()),
+        namespaced.exposure(&ToolName::namespaced("agents", "spawn_agent").to_string())
+    );
 }
 
 #[tokio::test]
@@ -3147,7 +3209,7 @@ async fn multi_agent_v2_bedrock_workers_only_delegate_when_model_supports_v2() {
 
         let spawn_agent_name = ToolName::namespaced("agents", "spawn_agent").to_string();
         let followup_task_name = ToolName::namespaced("agents", "followup_task").to_string();
-        let workflow_name = ToolName::namespaced("agents", "workflow").to_string();
+        let workflow_name = ToolName::namespaced("workflows", "workflow").to_string();
         assert_eq!(plan.can_manage_children, supports_delegation);
         if supports_delegation {
             plan.assert_visible_contains(&["agents"]);
@@ -3188,6 +3250,7 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
             "wait",
             "request_user_input",
             "agents",
+            "workflows",
             // Hosted Responses tool.
             "web_search",
         ]
@@ -3206,7 +3269,6 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
-        "workflow",
     ] {
         assert!(
             plan.namespace_function_names("agents")
@@ -3215,6 +3277,14 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
             "expected {tool_name} in agents namespace"
         );
     }
+    assert_eq!(
+        plan.namespace_function_names("workflows"),
+        &["workflow".to_string()]
+    );
+    assert_eq!(
+        plan.exposure(&ToolName::namespaced("workflows", "workflow").to_string()),
+        ToolExposure::DirectModelOnly
+    );
 }
 
 #[tokio::test]
@@ -3355,6 +3425,7 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
             "request_user_input",
             // Multi-agent v2 tools.
             MULTI_AGENT_V2_NAMESPACE,
+            "workflows",
             // Hosted Responses tools.
             "web_search",
         ]

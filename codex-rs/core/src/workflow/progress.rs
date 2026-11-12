@@ -78,6 +78,7 @@ fn project(states: &[WorkflowState]) -> UpdatePlanArgs {
         let attention = state.tasks.len() - returned - running - waiting;
         let status = match state.status {
             RunStatus::Running => "running",
+            RunStatus::AwaitingDecision => "awaiting coordinator decision",
             RunStatus::Paused => "paused",
             RunStatus::Completed => "completed",
             RunStatus::Cancelled => "cancelled",
@@ -124,6 +125,18 @@ fn project(states: &[WorkflowState]) -> UpdatePlanArgs {
                 PlanItemArg {
                     step: label,
                     status,
+                },
+            ));
+        }
+        if state.status == RunStatus::AwaitingDecision {
+            rows.push((
+                0,
+                PlanItemArg {
+                    step: format!(
+                        "{}: assess returned evidence and choose next work or finish",
+                        state.plan.id
+                    ),
+                    status: StepStatus::InProgress,
                 },
             ));
         }
@@ -192,14 +205,7 @@ fn task_detail(state: &WorkflowState, task: &TaskState) -> String {
                 .spec
                 .depends_on
                 .iter()
-                .filter(|id| {
-                    let prior = &state.tasks[*id];
-                    if task.spec.run_after_failure {
-                        !model::is_terminal(prior.status)
-                    } else {
-                        prior.status != TaskStatus::Completed
-                    }
-                })
+                .filter(|id| !model::dependency_ready(state, &task.spec, id))
                 .cloned()
                 .collect::<Vec<_>>();
             if waiting.is_empty() {

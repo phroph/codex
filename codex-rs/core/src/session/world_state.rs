@@ -25,6 +25,7 @@ use crate::context::world_state::ToolsState;
 use crate::context::world_state::TopLevelToolsState;
 use crate::context::world_state::WorldState;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
+use crate::tools::handlers::workflow::WORKFLOW_TOOL_NAMESPACE;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_extension_api::WorldStateContributionInput;
 use codex_features::Feature;
@@ -41,11 +42,11 @@ use codex_tools::ToolName;
 const MAX_ENVIRONMENT_SUBAGENTS: usize = 8;
 const MAX_ENVIRONMENT_SUBAGENT_BYTES: usize = 1_024;
 
-const WORKFLOW_ORCHESTRATION_GUIDANCE: &str = r#"Native workflow orchestration is available through `workflow`. Respect the current multi-agent mode and the user's scope. For complex, multifactor work that benefits from coordinated delegation, create a task-specific workflow with groups, focused task prompts, and explicit dependencies. Keep simple or tightly coupled work direct. Choose roles and verification steps for the actual task; no fixed investigator, verifier, or critic stages are required.
+const WORKFLOW_ORCHESTRATION_GUIDANCE: &str = r#"Native workflow design and execution are available through `workflows.workflow`. Respect the current multi-agent mode and the user's scope. For complex work involving several bodies of evidence, interacting components, or findings that determine later actions, invoke start with workflow_id and the user's goal, context and constraints. The runtime first runs a native planning agent to design concrete deliverables and their information dependencies, then executes that design. Do not substitute a flat batch of topic specialists for this planning phase. A supplied plan is only a proposal; the planner still designs against the objective. Keep simple work and a single focused delegation direct.
 
-The runtime runs ready tasks and supplies dependency results to dependent workers. Use status or wait to inspect progress, and revise the workflow when findings change the useful next work. Prefer one coordinator unless a group genuinely benefits from its own decomposition. Do not manually relay every report or duplicate the runtime's dependency scheduling. The runtime also publishes workflow progress to the existing plan/checklist display; avoid mirroring the same workflow with separate update_plan calls.
+Workflows may combine parallel branches, dependent integration or implementation tasks, and a frontier whose next work depends on actual findings. No fixed investigator/verifier/critic sequence is required. The design records its strategy, completion criteria and deferred decisions; use those to coordinate the objective. The runtime schedules ready tasks, supplies attributed reports to their consumers, and publishes its checklist. Do not duplicate this with manual report relays or separate update_plan calls.
 
-A completed worker has submitted a report, not established its claims as verified truth. Inspect the evidence for load-bearing claims and reconcile material omissions before drawing conclusions. State specific uncertainty when it affects the decision, and choose the next useful action; do not manufacture caveats, compulsory caveat sections, or blockers merely because uncertainty exists."#;
+When workers return, a designed workflow enters awaiting_decision. Inspect the reports and the original evidence for load-bearing claims, reconcile material disagreements, and assess the completion criteria. If the findings determine additional useful work, call advance with that assessment: a new planning pass uses the returned evidence to design the next frontier. For a narrow known adjustment use revise with concrete deliverables and input uses. Call finish with an explicit assessment only when the user's requested outcome is handled; worker completion alone is insufficient. These are autonomous coordinator decisions, not requests for user approval. Do not stop after the first parallel batch when its results leave the requested diagnosis, integration, implementation or acceptance work undone. Do not manufacture caveats or compulsory review layers when the evidence already resolves the objective."#;
 
 fn with_workflow_guidance(
     instructions: Option<MultiAgentRoleInstructions>,
@@ -415,10 +416,9 @@ impl Session {
         )
         .with_namespace(v2_namespace.clone());
         let workflow_available = turn_context.multi_agent_version == MultiAgentVersion::V2
-            && step_context.tool_router.exposes_tool(&ToolName::new(
-                turn_context.config.multi_agent_v2.tool_namespace.clone(),
-                "workflow",
-            ));
+            && step_context
+                .tool_router
+                .exposes_tool(&ToolName::namespaced(WORKFLOW_TOOL_NAMESPACE, "workflow"));
         if let Some(usage_hint_text) = with_workflow_guidance(
             super::multi_agents::usage_hint_text(step_context),
             workflow_available,

@@ -21,6 +21,11 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
+// `collaboration` is reserved by the API for its known native agent functions.
+// Custom workflow controls must keep their own namespace, regardless of the
+// configured namespace for those agent functions.
+pub(crate) const WORKFLOW_TOOL_NAMESPACE: &str = "workflows";
+
 pub(crate) struct WorkflowHandler;
 
 impl WorkflowHandler {
@@ -114,6 +119,11 @@ pub(crate) fn create_workflow_tool() -> ToolSpec {
                     "Predecessor task IDs whose results this task needs. Omit for independent work.",
                 ),
             ),
+            ("deliverable".into(), text("Concrete output required from this task. Required when revising work in a designed workflow.")),
+            ("inputs".into(), JsonSchema::array(JsonSchema::object(BTreeMap::from([
+                ("task_id".into(), text("A task in depends_on whose returned output this task consumes.")),
+                ("use_for".into(), text("How that specific output determines this task's work or decision.")),
+            ]), Some(vec!["task_id".into(), "use_for".into()]), Some(false.into())), Some("State the use of each work dependency; labels alone do not create handoffs.".into()))),
             (
                 "run_after_failure".into(),
                 boolean(
@@ -180,16 +190,17 @@ pub(crate) fn create_workflow_tool() -> ToolSpec {
     );
     ToolSpec::Function(ResponsesApiTool {
         name: "workflow".into(),
-        description: "Run and adapt native multi-agent workflows for complex work. Start a task-specific dependency graph; Codex dispatches ready tasks and passes predecessor results to successors. Tasks use native subagents and the current permissions. Use status to inspect results, wait for progress, revise to add/edit pending tasks, retry to explicitly rerun tasks and invalidate dependent results, pause to stop dispatch and interrupt workers, resume for pending work, or cancel. Interrupted tasks require explicit retry, so side effects are never silently replayed. The coordinator owns synthesis and consequential judgments; completed means a worker returned, not that its claims were verified. Choose roles and branches for the actual task; do not create mandatory review layers or new obligations from speculative caveats. Status without workflow_id lists saved workflows. All revisions/results are retained on disk.".into(),
+        description: "Design and execute native workflows from a complex objective. Start with workflow_id and goal (include scope and constraints); a native planning agent constructs a typed design of concrete deliverables and their information dependencies before any work is dispatched. An optional plan is only a proposal to that planner. The scheduler runs independent tasks concurrently and supplies actual predecessor reports to downstream work. When the graph returns, status becomes awaiting_decision, not completed: inspect reports against design.completion_criteria and deferred_decisions, then advance with assessment to plan remaining work from the findings, or finish with assessment when the objective is handled. Use revise for precise pending-task edits, retry for failed/interrupted work, pause/resume/cancel for execution control. Do not impose a fixed review ritual or finish merely because workers returned. Native permissions, model inheritance and shared capacity apply. Designs, revisions, decisions and reports are retained on disk. Status without workflow_id lists saved workflows.".into(),
         strict: false, defer_loading: None, output_schema: None,
         parameters: JsonSchema::object(BTreeMap::from([
-            ("action".into(), JsonSchema::string_enum(["start","status","wait","revise","retry","pause","resume","cancel"].into_iter().map(|s| json!(s)).collect(), None)),
-            ("workflow_id".into(), text("Workflow to inspect or manage. Start may use plan.id.")),
+            ("action".into(), JsonSchema::string_enum(["start","status","wait","advance","finish","revise","retry","pause","resume","cancel"].into_iter().map(|s| json!(s)).collect(), None)),
+            ("workflow_id".into(), text("Unique short ID for start; existing workflow ID for other actions. A proposal may supply plan.id.")),
             ("plan".into(), plan),
             ("tasks".into(), tasks),
-            ("remove_task_ids".into(), ids("For revise: obsolete unstarted tasks to remove. Update any dependent edges in the same call. Prior revisions stay in the journal.")),
-            ("goal".into(), text("For revise: updated objective or completion criteria when the user's direction or findings change the plan.")),
-            ("max_parallel".into(), number("For revise: update the concurrency limit for this workflow.")),
+            ("remove_task_ids".into(), ids("For revise: obsolete unstarted tasks to remove. A designed consumer cannot be removed or disconnected while its work inputs are unfinished; it runs when they return. An actual scope change requires updated goal and assessment identifying the change. Update dependent edges together. Prior revisions remain.")),
+            ("goal".into(), text("For start: the user's concrete objective, relevant context, scope and constraints. The planner designs the workflow; do not pre-flatten it into topic assignments. For revise: update the objective when user direction changes.")),
+            ("assessment".into(), text("Required for advance or finish, and for scope-changing revisions that remove a consumer of unfinished work. Assess actual findings against completion criteria. For advance identify useful remaining work; for finish explain why the requested outcome is handled. For a scope revision identify the actual changed objective or constraint; it is retained in the journal.")),
+            ("max_parallel".into(), number("For start or revise: simultaneous workers; defaults to 3 and respects shared native capacity.")),
             ("task_ids".into(), ids("Task IDs to retry. Downstream results are invalidated; running affected tasks must first be paused.")),
             ("expected_revision".into(), number("Optional revision precondition for a mutation. Omit when progress since the last status is acceptable.")),
             ("after_revision".into(), number("For wait: return on a later revision or a non-running state. Default is the revision at entry.")),

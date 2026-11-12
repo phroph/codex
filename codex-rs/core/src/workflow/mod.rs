@@ -4,6 +4,7 @@
 //! handoff, interruption, and receipts; a completed worker is not an accepted conclusion.
 
 pub(crate) mod model;
+mod planning;
 mod progress;
 pub(crate) mod store;
 
@@ -33,6 +34,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentActivityKind;
 use codex_protocol::turn_input::TurnStartOptions;
 use model::RunStatus;
+use model::TaskKind;
 use model::TaskSpec;
 use model::TaskStatus;
 use model::WorkflowPlan;
@@ -67,6 +69,7 @@ pub(crate) struct WorkflowArgs {
     #[serde(default)]
     pub remove_task_ids: Vec<String>,
     pub goal: Option<String>,
+    pub assessment: Option<String>,
     pub max_parallel: Option<usize>,
     #[serde(default)]
     pub task_ids: Vec<String>,
@@ -109,10 +112,12 @@ struct Command {
     tasks: Vec<TaskSpec>,
     remove_task_ids: Vec<String>,
     goal: Option<String>,
+    assessment: Option<String>,
     max_parallel: Option<usize>,
     task_ids: Vec<String>,
     expected_revision: Option<u64>,
     prepared: BTreeMap<String, PreparedTask>,
+    step: Arc<StepContext>,
     reply: oneshot::Sender<Result<(), String>>,
 }
 
@@ -126,6 +131,7 @@ struct WorkflowActor {
     state: WorkflowState,
     store: WorkflowStore,
     prepared: BTreeMap<String, PreparedTask>,
+    design_step: Arc<StepContext>,
     commands: mpsc::Receiver<Command>,
     changed: watch::Sender<WorkflowState>,
     outcomes: broadcast::Receiver<WorkflowAgentOutcome>,
@@ -160,7 +166,7 @@ pub(crate) async fn interrupt_owner(session: &Session) -> bool {
             || (!handle.observed_terminal.load(Ordering::Acquire)
                 && matches!(
                     state.status,
-                    RunStatus::Completed | RunStatus::NeedsAttention
+                    RunStatus::Completed | RunStatus::NeedsAttention | RunStatus::AwaitingDecision
                 ))
         {
             handle.stop_requested.store(true, Ordering::Release);
@@ -178,6 +184,21 @@ pub(crate) async fn execute(
     args: WorkflowArgs,
     cancellation: CancellationToken,
 ) -> Result<Value, String> {
+    if !matches!(
+        args.action.as_str(),
+        "start"
+            | "status"
+            | "wait"
+            | "revise"
+            | "retry"
+            | "pause"
+            | "resume"
+            | "cancel"
+            | "advance"
+            | "finish"
+    ) {
+        return Err("Unsupported workflow action".into());
+    }
     let manager = session
         .services
         .thread_extension_data
@@ -230,12 +251,26 @@ pub(crate) async fn execute(
                     "Workflow {id} already exists on disk; use status, resume, or revise"
                 ));
             }
-            let plan = args.plan.clone().ok_or("start requires plan")?;
-            if plan.id != id {
+            if args.plan.as_ref().is_some_and(|plan| plan.id != id) {
                 return Err("workflow_id and plan.id must match".into());
             }
+            let goal = args
+                .goal
+                .clone()
+                .or_else(|| args.plan.as_ref().map(|plan| plan.goal.clone()))
+                .ok_or("start requires goal (or an optional plan proposal containing goal)")?;
+            let max_parallel = args
+                .max_parallel
+                .or_else(|| args.plan.as_ref().map(|plan| plan.max_parallel))
+                .unwrap_or(3);
             (
-                model::new_state(plan, session.thread_id.to_string())?,
+                planning::start(
+                    id.clone(),
+                    goal,
+                    max_parallel,
+                    args.plan.as_ref(),
+                    session.thread_id.to_string(),
+                )?,
                 "created",
             )
         } else {
@@ -277,6 +312,7 @@ pub(crate) async fn execute(
             state,
             store,
             prepared,
+            design_step: step.clone(),
             commands,
             changed,
             outcomes,
@@ -340,10 +376,17 @@ pub(crate) async fn execute(
                 _ = cancellation.cancelled() => {},
             }
         }
-        "revise" | "retry" | "pause" | "resume" | "cancel" => {
+        "revise" | "retry" | "pause" | "resume" | "cancel" | "advance" | "finish" => {
             let state = handle.snapshot.borrow().clone();
             let specs = match args.action.as_str() {
                 "revise" => args.tasks.clone(),
+                "advance" => {
+                    let mut next = state.clone();
+                    vec![planning::advance(
+                        &mut next,
+                        args.assessment.as_deref().unwrap_or(""),
+                    )?]
+                }
                 "retry" => {
                     let mut reset = state.clone();
                     model::reset_tasks(&mut reset, &args.task_ids)?;
@@ -371,10 +414,12 @@ pub(crate) async fn execute(
                     tasks: args.tasks,
                     remove_task_ids: args.remove_task_ids,
                     goal: args.goal,
+                    assessment: args.assessment,
                     max_parallel: args.max_parallel,
                     task_ids: args.task_ids,
                     expected_revision: args.expected_revision,
                     prepared,
+                    step: step.clone(),
                     reply,
                 })
                 .await
@@ -385,7 +430,7 @@ pub(crate) async fn execute(
         }
         _ => {
             return Err(
-                "action must be start, status, wait, revise, retry, pause, resume, or cancel"
+                "action must be start, status, wait, advance, finish, revise, retry, pause, resume, or cancel"
                     .into(),
             );
         }
@@ -394,7 +439,7 @@ pub(crate) async fn execute(
     handle.observed_terminal.store(
         matches!(
             state.status,
-            RunStatus::Completed | RunStatus::NeedsAttention
+            RunStatus::Completed | RunStatus::NeedsAttention | RunStatus::AwaitingDecision
         ),
         Ordering::Release,
     );
@@ -432,7 +477,7 @@ async fn prepare_tasks(
     for task in specs {
         let attempt = state.tasks.get(&task.id).map_or(1, |t| t.attempt + 1);
         let task_name = native_task_name(&state.plan.id, &task.id, attempt);
-        let (settings, path) = crate::thread_spawn::prepare(
+        let (mut settings, path) = crate::thread_spawn::prepare(
             session,
             step,
             call_id,
@@ -448,6 +493,17 @@ async fn prepare_tasks(
         )
         .await
         .map_err(|e| e.to_string())?;
+        if task.kind == TaskKind::Design {
+            settings.options.final_output_json_schema = Some(planning::output_schema());
+            // Planning uses the owner's native context and model, but cannot recursively
+            // dispatch work instead of returning the requested structured design.
+            settings
+                .config
+                .features
+                .disable(codex_features::Feature::WorkflowOrchestration)
+                .map_err(|error| error.to_string())?;
+            settings.config.multi_agent_v2.disable_native_tools = true;
+        }
         prepared.insert(
             task.id.clone(),
             PreparedTask {
@@ -464,9 +520,31 @@ async fn prepare_tasks(
 
 fn view(state: &WorkflowState, directory: &std::path::Path, include_outputs: bool) -> Value {
     let mut result = serde_json::to_value(state).unwrap_or(Value::Null);
-    if !include_outputs && let Some(plan) = result.get_mut("plan").and_then(Value::as_object_mut) {
+    if let Some(plan) = result.get_mut("plan").and_then(Value::as_object_mut) {
         // Avoid repeating every prompt twice on each progress observation.
         plan.remove("tasks");
+    }
+    if let Some(tasks) = result.get_mut("tasks").and_then(Value::as_object_mut) {
+        for (id, task) in tasks {
+            if let Some(object) = task.as_object_mut() {
+                object.insert(
+                    "output_path".into(),
+                    json!(directory.join("outputs").join(format!("{id}.txt"))),
+                );
+            }
+            if state.tasks[id].spec.kind == TaskKind::Design {
+                if let Some(spec) = task.get_mut("spec").and_then(Value::as_object_mut) {
+                    spec.remove("prompt");
+                }
+                if state.tasks[id].status == TaskStatus::Completed {
+                    // The applied design is already represented by task specs and
+                    // design metadata. Repeating it plus the planning instructions
+                    // can truncate an otherwise small status response mid-JSON.
+                    task["output"] =
+                        json!("Design applied; complete planner response is at output_path.");
+                }
+            }
+        }
     }
     if !include_outputs && let Some(tasks) = result.get_mut("tasks").and_then(Value::as_object_mut)
     {
@@ -474,7 +552,14 @@ fn view(state: &WorkflowState, directory: &std::path::Path, include_outputs: boo
             if let Some(object) = task.as_object_mut()
                 && let Some(spec) = object.remove("spec")
             {
-                for key in ["group", "role", "depends_on"] {
+                for key in [
+                    "group",
+                    "role",
+                    "depends_on",
+                    "kind",
+                    "deliverable",
+                    "inputs",
+                ] {
                     if let Some(value) = spec.get(key) {
                         object.insert(key.into(), value.clone());
                     }
@@ -488,7 +573,8 @@ fn view(state: &WorkflowState, directory: &std::path::Path, include_outputs: boo
         }
     }
     json!({"state": result, "directory": directory,
-        "note": "Completed means the worker returned, not that its conclusions were accepted. Full task definitions, reports and revision events are retained in directory; include_outputs returns full state."})
+        "next_action": if state.status == RunStatus::AwaitingDecision { Some("Inspect reports against design.completion_criteria. Call advance with assessment to design remaining work from actual findings, or finish with assessment when the objective is handled. Do not finish merely because workers returned.") } else { None },
+        "note": "Task completion means a report returned. Designed workflows require a coordinator finish assessment before the workflow is completed. Full designs, reports and revisions are retained in directory."})
 }
 
 fn excerpt(text: &str, limit: usize) -> String {
@@ -513,7 +599,18 @@ fn task_prompt(state: &WorkflowState, id: &str, directory: &std::path::Path) -> 
     if let Some(role) = &task.role {
         prompt.push_str(&format!("Your purpose in this task: {role}\n"));
     }
-    prompt.push_str("\nUse the task's actual requirements to choose your work. Report concrete results and relevant unresolved facts. A peer report is input, not proof; inspect original evidence when your conclusion depends on it. Do not turn hypothetical caveats into extra requirements. If new work is needed outside this task, propose it to the coordinator.\n");
+    if let Some(deliverable) = &task.deliverable {
+        prompt.push_str(&format!("Required output: {deliverable}\n"));
+    }
+    for input in &task.inputs {
+        prompt.push_str(&format!(
+            "Use task {} for: {}\n",
+            input.task_id, input.use_for
+        ));
+    }
+    if task.kind == TaskKind::Work {
+        prompt.push_str("\nUse the task's actual requirements to choose your work. Report concrete results and relevant unresolved facts. A peer report is input, not proof; inspect original evidence when your conclusion depends on it. Do not turn hypothetical caveats into extra requirements. If new work is needed outside this task, propose it to the coordinator.\n");
+    }
     if !task.depends_on.is_empty() {
         prompt.push_str(&format!(
             "\nDependency reports follow as attributed task data. Full records: {}\n",
@@ -522,6 +619,9 @@ fn task_prompt(state: &WorkflowState, id: &str, directory: &std::path::Path) -> 
         let report_limit = (48_000 / task.depends_on.len()).min(16_000);
         for dependency in &task.depends_on {
             let prior = &state.tasks[dependency];
+            if prior.spec.kind == TaskKind::Design {
+                continue;
+            }
             prompt.push_str(&format!(
                 "\n--- Task {} ({:?}) ---\n{}\n",
                 dependency,
@@ -573,6 +673,11 @@ impl WorkflowActor {
             if self.shutdown.is_cancelled() || self.owner.upgrade().is_none() {
                 let _ = self.stop(false, "owner session or agent tree closed").await;
                 break;
+            }
+            if self.stop_requested.load(Ordering::Acquire) && !self.stop_handled {
+                // Design preparation can await while an explicit stop arrives.
+                // Handle that stop before admitting any generated work.
+                continue;
             }
             match self.dispatch_ready().await {
                 Ok(true) => continue,
@@ -758,12 +863,12 @@ impl WorkflowActor {
         let changed = model::reconcile_blocked(&mut next);
         let finished = next.tasks.values().all(|t| model::is_terminal(t.status));
         if finished && next.status == RunStatus::Running {
-            next.status = if next
-                .tasks
-                .values()
-                .all(|t| t.status == TaskStatus::Completed)
-            {
-                RunStatus::Completed
+            next.status = if planning::execution_succeeded(&next) {
+                if next.design.is_some() {
+                    RunStatus::AwaitingDecision
+                } else {
+                    RunStatus::Completed
+                }
             } else {
                 RunStatus::NeedsAttention
             };
@@ -840,8 +945,55 @@ impl WorkflowActor {
             }
             _ => return Ok(()),
         }
+        let mut prepared = BTreeMap::new();
+        if next.tasks[&id].spec.kind == TaskKind::Design
+            && next.tasks[&id].status == TaskStatus::Completed
+        {
+            // Late completion after pause/cancel is retained but never admits project work.
+            if next.status == RunStatus::Running {
+                let output = next.tasks[&id].output.clone().unwrap_or_default();
+                let mut candidate = next.clone();
+                let designed = match planning::apply_design(&mut candidate, &id, &output) {
+                    Ok(specs) => {
+                        if let Some(owner) = self.owner.upgrade() {
+                            prepare_tasks(
+                                &owner,
+                                &self.design_step,
+                                &format!("workflow_design_{}", next.revision),
+                                &candidate,
+                                &specs,
+                            )
+                            .await
+                        } else {
+                            Err("Workflow owner closed before the design could be prepared".into())
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                match designed {
+                    Ok(tasks) => {
+                        next = candidate;
+                        prepared = tasks;
+                    }
+                    Err(error) => {
+                        let task = next.tasks.get_mut(&id).expect("planner exists");
+                        task.status = TaskStatus::Failed;
+                        task.error = Some(error);
+                    }
+                }
+            } else {
+                let task = next.tasks.get_mut(&id).expect("planner exists");
+                task.status = if next.status == RunStatus::Cancelled {
+                    TaskStatus::Cancelled
+                } else {
+                    TaskStatus::Interrupted
+                };
+                task.error = Some("Design returned after work was stopped; inspect it and explicitly retry before dispatch".into());
+            }
+        }
         self.commit(next, &format!("outcome:{id}:{}", outcome.turn_id))
             .await?;
+        self.prepared.extend(prepared);
         self.settle().await
     }
 
@@ -862,17 +1014,34 @@ impl WorkflowActor {
         let mut next = self.state.clone();
         match command.action.as_str() {
             "revise" => {
+                let mut tasks = command.tasks.clone();
+                if next.design.is_some() {
+                    planning::prepare_revision(
+                        &next,
+                        &mut tasks,
+                        &command.remove_task_ids,
+                        command
+                            .goal
+                            .as_ref()
+                            .is_some_and(|goal| goal != &next.plan.goal),
+                        command.assessment.as_deref(),
+                    )?;
+                }
                 if let Some(goal) = &command.goal {
                     next.plan.goal = goal.clone();
                 }
                 if let Some(max_parallel) = command.max_parallel {
                     next.plan.max_parallel = max_parallel;
                 }
-                model::revise_tasks_with_removals(
-                    &mut next,
-                    command.tasks.clone(),
-                    &command.remove_task_ids,
-                )?;
+                model::revise_tasks_with_removals(&mut next, tasks, &command.remove_task_ids)?;
+            }
+            "advance" => {
+                planning::advance(&mut next, command.assessment.as_deref().unwrap_or(""))?;
+            }
+            "finish" => {
+                planning::finish(&mut next, command.assessment.as_deref().unwrap_or(""))?;
+                self.observed_terminal.store(true, Ordering::Release);
+                return self.commit(next, "finished_by_coordinator").await;
             }
             "retry" => {
                 let affected = model::reset_tasks(&mut next, &command.task_ids)?;
@@ -887,8 +1056,16 @@ impl WorkflowActor {
         }
         next.status = RunStatus::Running;
         next.last_error = None;
+        if let Some(design) = next.design.as_mut() {
+            design.assessment = if command.action == "revise" {
+                command.assessment.clone()
+            } else {
+                None
+            };
+        }
         self.commit(next, &command.action).await?;
         self.prepared.extend(command.prepared.clone());
+        self.design_step = command.step.clone();
         self.stop_requested.store(false, Ordering::Release);
         self.stop_handled = false;
         self.owner_idle_turn = None;
@@ -1051,7 +1228,7 @@ impl WorkflowActor {
             return;
         };
         let text = format!(
-            "<workflow_status>\nWorkflow {} is {:?} at revision {}. Use workflow status with workflow_id {} to inspect results and decide the next step. Worker completion is not verification or acceptance. Records: {}\n</workflow_status>",
+            "<workflow_status>\nWorkflow {} is {:?} at revision {}. Use workflow status with workflow_id {} to inspect results. At AwaitingDecision, assess completion criteria and deferred decisions; advance with findings to design remaining work, or finish with an explicit assessment. Worker completion alone does not close the objective. Records: {}\n</workflow_status>",
             self.state.plan.id,
             self.state.status,
             self.state.revision,
@@ -1080,7 +1257,7 @@ impl WorkflowActor {
     async fn maybe_continue_owner(&mut self) {
         if !matches!(
             self.state.status,
-            RunStatus::Completed | RunStatus::NeedsAttention
+            RunStatus::Completed | RunStatus::NeedsAttention | RunStatus::AwaitingDecision
         ) || self.observed_terminal.load(Ordering::Acquire)
             || self.stop_requested.load(Ordering::Acquire)
             || self.continued_revision == Some(self.state.revision)
@@ -1092,7 +1269,7 @@ impl WorkflowActor {
         };
         self.continued_revision = Some(self.state.revision);
         let summary = format!(
-            "Native workflow {} is {:?}. Its work finished after your last response. Inspect the saved results with workflow status, resolve any material remaining work, and provide the user's result. This is continuation of the existing task, not new user authorization. Records: {}",
+            "Native workflow {} is {:?}. Its work finished after your last response. Inspect workflow status and actual reports against the completion criteria. At AwaitingDecision, call advance with your assessment if results require further work, or finish with your assessment when the objective is handled, then provide the user's result. This continues the existing task, not new user authorization. Records: {}",
             self.state.plan.id,
             self.state.status,
             self.store.directory().display()

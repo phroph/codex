@@ -109,6 +109,7 @@ use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::PersistContext;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
+use core_test_support::responses;
 use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
 use std::future::Future;
@@ -2128,6 +2129,90 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
         .await
         .expect("thread should be registered");
     wait_for_recorded_user_message(thread.as_ref(), "spawned").await;
+}
+
+#[test_case::test_case(true; "structured output")]
+#[test_case::test_case(false; "ordinary output")]
+#[tokio::test]
+async fn native_spawn_forwards_final_output_schema_to_model_request(structured_output: bool) {
+    let server = responses::start_mock_server().await;
+    let request_log = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("child-message", r#"{"answer":"done"}"#),
+            responses::ev_completed("child-response"),
+        ]),
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_id, parent) = harness.start_thread().await;
+    let source = thread_spawn_source(
+        parent_id,
+        &parent.session_source,
+        next_thread_spawn_depth(&parent.session_source),
+        /*agent_role*/ None,
+        Some("structured_worker".to_string()),
+    )
+    .expect("child source");
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "answer": { "type": "string" } },
+        "required": ["answer"],
+        "additionalProperties": false,
+    });
+    let (agent, _) = harness
+        .control
+        .spawn(SpawnRequest {
+            caller: parent_id,
+            config: harness.config.clone(),
+            input: AgentInput::Message {
+                message: AgentMessage::Plaintext("Return the child result".to_string()),
+                mode: MessageDeliveryMode::TriggerTurn,
+            },
+            source,
+            options: SpawnAgentOptions {
+                parent_thread_id: Some(parent_id),
+                final_output_json_schema: structured_output.then(|| schema.clone()),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("spawn child");
+    let child = harness
+        .manager
+        .get_thread(agent.thread_id)
+        .await
+        .expect("child is registered");
+    let completed = timeout(Duration::from_secs(10), async {
+        loop {
+            let event = child.next_event().await.expect("child event stream");
+            if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                break event.msg;
+            }
+        }
+    })
+    .await
+    .expect("child completes");
+    assert!(
+        matches!(completed, EventMsg::TurnComplete(event) if event.error.is_none()),
+        "child turn should complete successfully"
+    );
+    let body = request_log.single_request().body_json();
+    if structured_output {
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(body["text"]["format"]["schema"], schema);
+    } else {
+        assert!(body.pointer("/text/format").is_none());
+    }
+    child.shutdown_and_wait().await.expect("shutdown child");
+    parent.shutdown_and_wait().await.expect("shutdown parent");
 }
 
 #[test_case::test_case(None, ReasoningEffort::Medium; "model default")]

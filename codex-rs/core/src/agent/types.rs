@@ -39,6 +39,9 @@ pub struct SpawnAgentOptions {
     pub disabled_plugin_ids: Option<Vec<String>>,
     pub multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
     pub cyber_access_program: Option<CyberAccessProgram>,
+    /// Structured response contract for the child's initial turn, when requested by
+    /// a native caller. Ordinary delegated work keeps its unrestricted final output.
+    pub final_output_json_schema: Option<serde_json::Value>,
 }
 
 /// Identity and status observed from a loaded agent, without a handle to its runtime.

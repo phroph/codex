@@ -44,12 +44,44 @@ pub(crate) struct TaskSpec {
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub inherit_context: bool,
+    #[serde(default)]
+    pub kind: TaskKind,
+    #[serde(default)]
+    pub deliverable: Option<String>,
+    #[serde(default)]
+    pub inputs: Vec<TaskInput>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskKind {
+    #[default]
+    Work,
+    Design,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskInput {
+    pub task_id: String,
+    pub use_for: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesignState {
+    pub round: u32,
+    pub strategy: String,
+    pub completion_criteria: Vec<String>,
+    pub deferred_decisions: Vec<String>,
+    pub assessment: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunStatus {
     Running,
+    AwaitingDecision,
     Paused,
     Completed,
     Cancelled,
@@ -103,6 +135,9 @@ pub(crate) struct WorkflowState {
     #[serde(default)]
     pub last_error: Option<String>,
     pub tasks: BTreeMap<String, TaskState>,
+    // Missing in pre-design journals. Loading those workflows preserves their lifecycle.
+    #[serde(default)]
+    pub design: Option<DesignState>,
 }
 
 /// Keep identifiers portable and safe as individual filesystem components.
@@ -156,6 +191,19 @@ pub(crate) fn validate_plan(plan: &WorkflowPlan) -> Result<(), String> {
                 && (value.trim().is_empty() || value.len() > 1024)
             {
                 return Err(format!("{name} for {} must contain 1–1024 bytes", task.id));
+            }
+        }
+        if let Some(deliverable) = &task.deliverable {
+            validate_text(deliverable, &format!("deliverable for {}", task.id))?;
+        }
+        let mut inputs = BTreeSet::new();
+        for input in &task.inputs {
+            validate_text(&input.use_for, "input use")?;
+            if !task.depends_on.contains(&input.task_id) || !inputs.insert(&input.task_id) {
+                return Err(format!(
+                    "task {} has an input without a unique dependency: {}",
+                    task.id, input.task_id
+                ));
             }
         }
     }
@@ -234,11 +282,31 @@ pub(crate) fn new_state(
         status: RunStatus::Running,
         last_error: None,
         tasks,
+        design: None,
     })
 }
 
 pub(crate) fn is_terminal(status: TaskStatus) -> bool {
     !matches!(status, TaskStatus::Pending | TaskStatus::Running)
+}
+
+pub(super) fn dependency_ready(state: &WorkflowState, spec: &TaskSpec, id: &str) -> bool {
+    let Some(dependency) = state.tasks.get(id) else {
+        return false;
+    };
+    dependency.status == TaskStatus::Completed
+        || (is_terminal(dependency.status)
+            && (spec.run_after_failure
+                // Explicit advancement has already accepted these prior results as
+                // planning inputs. Their failure reports can inform recovery work;
+                // failures inside the new frontier still block their consumers.
+                || (spec.kind == TaskKind::Work && spec.depends_on.iter().any(|planner_id| {
+                    state.tasks.get(planner_id).is_some_and(|planner| {
+                        planner.spec.kind == TaskKind::Design
+                            && planner.status == TaskStatus::Completed
+                            && planner.spec.depends_on.contains(&id.to_string())
+                    })
+                }))))
 }
 
 pub(crate) fn ready_tasks(state: &WorkflowState) -> Vec<String> {
@@ -260,12 +328,10 @@ pub(crate) fn ready_tasks(state: &WorkflowState) -> Vec<String> {
                 .tasks
                 .get(&spec.id)
                 .is_some_and(|task| task.status == TaskStatus::Pending)
-                && spec.depends_on.iter().all(|id| {
-                    state.tasks.get(id).is_some_and(|dependency| {
-                        dependency.status == TaskStatus::Completed
-                            || (spec.run_after_failure && is_terminal(dependency.status))
-                    })
-                })
+                && spec
+                    .depends_on
+                    .iter()
+                    .all(|id| dependency_ready(state, spec, id))
         })
         .take(capacity)
         .map(|spec| spec.id.clone())
@@ -289,9 +355,9 @@ pub(crate) fn reconcile_blocked(state: &mut WorkflowState) -> bool {
                     .depends_on
                     .iter()
                     .filter(|dependency| {
-                        state.tasks.get(*dependency).is_some_and(|dependency| {
-                            is_terminal(dependency.status)
-                                && dependency.status != TaskStatus::Completed
+                        state.tasks.get(*dependency).is_some_and(|prior| {
+                            is_terminal(prior.status)
+                                && !dependency_ready(state, &task.spec, dependency)
                         })
                     })
                     .cloned()
@@ -422,6 +488,14 @@ pub(crate) fn reset_tasks(
         if !state.tasks.contains_key(id) {
             return Err(format!("unknown task {id}"));
         }
+        if state.tasks[id].spec.kind == TaskKind::Design
+            && state.tasks[id].status == TaskStatus::Completed
+        {
+            return Err(
+                "A completed design cannot be replayed; use advance with the remaining objective"
+                    .into(),
+            );
+        }
         affected.insert(id.clone());
     }
     loop {
@@ -441,6 +515,11 @@ pub(crate) fn reset_tasks(
         }
     }
     for id in &affected {
+        if state.tasks.get(id).is_some_and(|task| {
+            task.spec.kind == TaskKind::Design && task.status == TaskStatus::Completed
+        }) {
+            return Err("Those results were consumed by a later design; use advance to plan the recheck and its follow-on work".into());
+        }
         if state
             .tasks
             .get(id)
