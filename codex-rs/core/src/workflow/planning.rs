@@ -65,7 +65,7 @@ Plan the reasoning and information flow, not merely a division of topics. Start 
 
 When several investigations jointly determine a diagnosis, recommendation, implementation, or acceptance decision, design the useful downstream integration/check/implementation task that consumes them. Its deliverable should resolve a concrete cross-branch question against underlying evidence, test a mechanism, or produce an artifact needed for the objective. Do not create a task merely to draft the owner's final answer or repeat the reports: final synthesis belongs to the owner. Do not hide an entire discovery, decision, implementation and verification chain inside each parallel specialist. Conversely, do not add a verifier or critic just for ceremony, require a fixed role sequence, or create dependencies whose outputs are not used. Groups describe meaningful work stages or branches; labels alone do not sequence work.
 
-Choose the smallest useful graph for this objective. A broad audit often needs a shared current-state/evidence baseline, independent analyses, and a later reconciliation of actual findings; a repair may need diagnosis before implementation and a focused behavior check afterward. These are examples, not templates. Make any independent check concrete about the claim or artifact it will inspect. Keep the owner's final judgment with the owner.
+Choose the smallest useful graph for this objective. A broad audit often needs a shared current-state/evidence baseline, independent analyses, and a later reconciliation of actual findings; a repair may need diagnosis before implementation and a focused behavior check afterward. These are examples, not templates. Make any independent check concrete about the claim or artifact it will inspect. Keep the owner's final judgment with the owner. When the runtime's acceptance review is enabled, independent reviewers check the owner's draft final answer before completion; do not add a task that reviews the final answer.
 
 If the contents of the first results must determine what to do next, plan only that useful frontier and put the exact decision/questions in deferred_decisions. The runtime will stop at a coordinator checkpoint after this graph returns. The owner can advance with actual reports to design the next frontier. Do not invent future findings or repeat completed work. On a later planning round, use those reports and the owner's assessment to add only necessary remaining tasks. Return no tasks only if existing results now suffice for the owner's final synthesis; explain this in strategy. Initial designs must contain actual work.
 
@@ -152,10 +152,23 @@ pub(super) fn advance(state: &mut WorkflowState, assessment: &str) -> Result<Tas
         .round
         .checked_add(1)
         .ok_or("planning round overflow")?;
+    // Returned acceptance findings are evidence for the next frontier.
+    let findings = super::review::awaiting_response(state)
+        .map(|review| {
+            let mut text = format!("\n{}:\n", super::review::summary(review));
+            for issue in &review.issues {
+                text.push_str(&format!(
+                    "- [{:?}/{}] {}: {} (evidence: {})\n",
+                    issue.severity, issue.lens, issue.title, issue.detail, issue.evidence
+                ));
+            }
+            text
+        })
+        .unwrap_or_default();
     let task = design_task(
         round,
         format!(
-            "Owner's decision about actual results and remaining work:\n{assessment}\nPrevious strategy: {}\nCompletion criteria: {:?}\nDeferred decisions: {:?}\nUse the actual dependency reports below, not the original proposal alone.",
+            "Owner's decision about actual results and remaining work:\n{assessment}\nPrevious strategy: {}\nCompletion criteria: {:?}\nDeferred decisions: {:?}{findings}\nUse the actual dependency reports below, not the original proposal alone.",
             design.strategy, design.completion_criteria, design.deferred_decisions
         ),
         state
@@ -167,6 +180,7 @@ pub(super) fn advance(state: &mut WorkflowState, assessment: &str) -> Result<Tas
             .collect(),
     );
     model::revise_tasks_with_removals(state, vec![task.clone()], &[])?;
+    super::review::supersede(state);
     let design = state.design.as_mut().expect("design exists");
     design.round = round;
     design.assessment = None;
@@ -221,6 +235,9 @@ pub(super) fn validate_work(specs: &[TaskSpec], state: &WorkflowState) -> Result
     for task in specs {
         if task.kind != TaskKind::Work || task.id.starts_with("_design_") {
             return Err("Only the runtime can create workflow design tasks".into());
+        }
+        if super::review::is_review_task(&task.id) {
+            return Err("Only the runtime can create acceptance review tasks".into());
         }
         nonempty(
             task.deliverable.as_deref().unwrap_or(""),

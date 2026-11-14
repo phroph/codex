@@ -77,6 +77,7 @@ fn project(states: &[WorkflowState]) -> UpdatePlanArgs {
             .count();
         let attention = state.tasks.len() - returned - running - waiting;
         let status = match state.status {
+            RunStatus::Running if super::review::in_progress(state) => "acceptance review running",
             RunStatus::Running => "running",
             RunStatus::AwaitingDecision => "awaiting coordinator decision",
             RunStatus::Paused => "paused",
@@ -129,13 +130,21 @@ fn project(states: &[WorkflowState]) -> UpdatePlanArgs {
             ));
         }
         if state.status == RunStatus::AwaitingDecision {
+            let step = match super::review::awaiting_response(state) {
+                Some(review) => format!(
+                    "{}: {}; answer them, then finish",
+                    state.plan.id,
+                    super::review::summary(review)
+                ),
+                None => format!(
+                    "{}: assess returned evidence and choose next work or finish",
+                    state.plan.id
+                ),
+            };
             rows.push((
                 0,
                 PlanItemArg {
-                    step: format!(
-                        "{}: assess returned evidence and choose next work or finish",
-                        state.plan.id
-                    ),
+                    step,
                     status: StepStatus::InProgress,
                 },
             ));

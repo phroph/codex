@@ -140,11 +140,22 @@ async fn fixture(server: &MockServer) -> Result<(TempDir, TestAppServer)> {
     fixture_at_url(&server.uri()).await
 }
 
+/// Scheduler scenarios keep the single-step finish; review has its own scenario.
 async fn fixture_at_url(url: &str) -> Result<(TempDir, TestAppServer)> {
+    fixture_with_review(url, false).await
+}
+
+async fn fixture_with_review(url: &str, review: bool) -> Result<(TempDir, TestAppServer)> {
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(url)
+    let config = MockResponsesConfig::new(url)
         .with_model("gpt-5.4")
-        .enable_feature(Feature::WorkflowOrchestration)
+        .enable_feature(Feature::WorkflowOrchestration);
+    let config = if review {
+        config.enable_feature(Feature::WorkflowReview)
+    } else {
+        config.disable_feature(Feature::WorkflowReview)
+    };
+    config
         .with_extra_config(
             "[features.multi_agent_v2]\nenabled = true\nmax_concurrent_threads_per_session = 4\nroot_agent_usage_hint_text = \"Configured root role.\"",
         )
@@ -1281,5 +1292,243 @@ async fn workflow_rejects_premature_consumer_removal_and_runs_the_evidence_hando
     );
     assert!(assigned_task(&consumers[0]).is_some_and(|text| text.contains(EVIDENCE_RESULT)));
     responses_server.abort();
+    Ok(())
+}
+
+fn assigned_review(body: &Value) -> Option<String> {
+    body["input"].as_array()?.iter().rev().find_map(|item| {
+        if item["type"] != "agent_message" {
+            return None;
+        }
+        item["content"].as_array()?.iter().find_map(|span| {
+            let text = span["text"].as_str()?;
+            text.contains("independent acceptance review panel")
+                .then(|| text.to_string())
+        })
+    })
+}
+
+async fn reviewer(server: &MockServer, lens_title: &'static str, output: Value) -> ResponseMock {
+    responses::mount_sse_once_match(
+        server,
+        move |request: &Request| {
+            assigned_review(&serde_json::from_slice(&request.body).expect("request JSON"))
+                .is_some_and(|text| text.contains(&format!("## Your lens: {lens_title}\n")))
+        },
+        completed_response(&format!("review-{}", lens_title.len()), &output.to_string()),
+    )
+    .await
+}
+
+/// Before completion, fresh lens reviewers check the coordinator's draft answer
+/// against the user's own words. Their blocking finding needs a recorded
+/// response; it does not veto completion.
+#[tokio::test]
+async fn finish_runs_independent_lens_review_before_the_workflow_completes() -> Result<()> {
+    const WORKFLOW_ID: &str = "reviewed-diagnosis";
+    const CAPTURE_PROMPT: &str = "capture-the-failing-session";
+    const CAPTURE_RESULT: &str = "Capture evidence: the 10-minute window recorded no failure.";
+    const USER_REQUEST: &str =
+        "Keep capturing until an RDP integrity failure is recorded, then diagnose it.";
+    const DRAFT: &str =
+        "DRAFT ANSWER: the network path is ruled out because the capture was clean.";
+    const BLOCKING: &str = "Capture stopped on a clean window";
+    const RESPONSE: &str =
+        "Corrected: the final answer keeps the capture armed until a failure is recorded.";
+    const UNANSWERED_CALL: &str = "workflow-finish-unanswered";
+    const ANSWERED_CALL: &str = "workflow-finish-answered";
+
+    let server = responses::start_mock_server().await;
+    let _designer = planner(&server, WORKFLOW_ID, 1, design(json!([
+        {"id": "capture", "prompt": CAPTURE_PROMPT, "group": "evidence", "role": "capture the failure", "deliverable": "Capture correlated with failures", "inputs": []}
+    ]))).await;
+    let _capture = worker(&server, CAPTURE_PROMPT, CAPTURE_RESULT).await;
+    let issue = |severity: &str, title: &str| json!({"severity": severity, "title": title, "detail": format!("{title}: detail"), "evidence": "capture summary"});
+    let measure = reviewer(
+        &server,
+        "Re-derive numbers and mechanisms from primary data",
+        json!({"verdict": "accept", "issues": [], "checks_run": ["read the capture report"]}),
+    )
+    .await;
+    let sufficiency = reviewer(
+        &server,
+        "Evidence sufficiency and stopping rules",
+        json!({"verdict": "revise", "issues": [issue("minor", "Name the capture filter"), issue("blocking", BLOCKING)], "checks_run": ["compared the window with the failure rate"]}),
+    )
+    .await;
+    let coverage = reviewer(
+        &server,
+        "Requirement coverage and faithful reporting",
+        json!({"verdict": "accept", "issues": [], "checks_run": ["mapped each ask"]}),
+    )
+    .await;
+
+    let root_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&root_requests);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(is_root_request)
+        .respond_with(move |request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("root request JSON");
+            let mut requests = captured.lock().expect("root request log");
+            requests.push(body.clone());
+            let response = match latest_workflow_result(&body) {
+                None => workflow_call(START_CALL, json!({
+                    "action": "start", "workflow_id": WORKFLOW_ID,
+                    "goal": "Diagnose the RDP integrity failure from captured evidence"
+                })),
+                Some((call_id, _)) if call_id == UNANSWERED_CALL => workflow_call(ANSWERED_CALL, json!({
+                    "action": "finish", "workflow_id": WORKFLOW_ID,
+                    "assessment": "The path is not yet proven; the final answer says so.",
+                    "review_response": RESPONSE, "include_outputs": true
+                })),
+                Some((_, result)) if result["state"]["status"] == "awaiting_decision"
+                    && result["state"]["design"]["reviews"].is_null() => workflow_call(FINISH_CALL, json!({
+                    "action": "finish", "workflow_id": WORKFLOW_ID,
+                    "assessment": "The clean capture rules out the network path.",
+                    "draft_answer": DRAFT, "include_outputs": true
+                })),
+                Some((_, result)) if result["state"]["status"] == "awaiting_decision" => workflow_call(UNANSWERED_CALL, json!({
+                    "action": "finish", "workflow_id": WORKFLOW_ID,
+                    "assessment": "Handled.", "include_outputs": true
+                })),
+                Some((_, result)) if result["state"]["status"] == "running" && requests.len() < 64 => workflow_call(
+                    &format!("workflow-wait-{}", requests.len()),
+                    json!({"action": "wait", "workflow_id": WORKFLOW_ID, "timeout_ms": 60000, "after_revision": result["state"]["revision"], "include_outputs": true}),
+                ),
+                Some((_, result)) => completed_response("root-reviewed-result", &result.to_string()),
+            };
+            responses::sse_response(response)
+        })
+        .mount(&server)
+        .await;
+
+    let (_codex_home, mut app_server) = fixture_with_review(&server.uri(), true).await?;
+    let root_thread_id = start_thread(&mut app_server).await?;
+    run_turn(&mut app_server, &root_thread_id, USER_REQUEST).await?;
+
+    let requests = root_requests.lock().expect("root request log").clone();
+    let result_of = |wanted: &str| {
+        requests.iter().find_map(|request| {
+            latest_workflow_result(request)
+                .filter(|(call_id, _)| call_id == wanted)
+                .map(|(_, result)| result)
+        })
+    };
+    let started = result_of(FINISH_CALL).context("review start result")?;
+    assert_eq!(started["state"]["status"], "running");
+    assert!(
+        started["next_action"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("Acceptance reviewers are checking")),
+        "review start hint: {started}"
+    );
+    let unanswered = result_of(UNANSWERED_CALL).context("unanswered finish result")?;
+    assert!(
+        unanswered["tool_error"].as_str().is_some_and(|error| {
+            error.contains("1 blocking, 0 major and 1 minor") && error.contains("review_response")
+        }),
+        "a blocking finding needs a recorded response: {unanswered}"
+    );
+    let (call_id, result) = latest_workflow_result(requests.last().context("final root request")?)
+        .context("completed workflow")?;
+    assert_eq!(call_id, ANSWERED_CALL);
+    assert_eq!(result["state"]["status"], "completed");
+    let review = &result["state"]["design"]["reviews"][0];
+    assert_eq!(review["complete"], true);
+    assert_eq!(review["response"], RESPONSE);
+    assert_eq!(review["issues"][0]["severity"], "blocking");
+    assert_eq!(review["issues"][0]["lens"], "sufficiency");
+    assert_eq!(review["issues"][0]["title"], BLOCKING);
+    assert_eq!(review["failed_reviewers"], json!([]));
+
+    let text = json!({"type": "string"});
+    let schema = json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {
+            "verdict": {"type": "string", "enum": ["accept", "revise"]},
+            "issues": {"type": "array", "items": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "severity": {"type": "string", "enum": ["blocking", "major", "minor"]},
+                    "title": text, "detail": text, "evidence": text
+                },
+                "required": ["severity", "title", "detail", "evidence"]
+            }},
+            "checks_run": {"type": "array", "items": text}
+        },
+        "required": ["verdict", "issues", "checks_run"]
+    });
+    for (lens, title, mock) in [
+        (
+            "measure",
+            "Re-derive numbers and mechanisms from primary data",
+            measure,
+        ),
+        (
+            "sufficiency",
+            "Evidence sufficiency and stopping rules",
+            sufficiency,
+        ),
+        (
+            "coverage",
+            "Requirement coverage and faithful reporting",
+            coverage,
+        ),
+    ] {
+        let task = &result["state"]["tasks"][format!("_review_1_{lens}")];
+        assert_eq!(task["status"], "completed");
+        assert_eq!(task["spec"]["kind"], "review");
+        assert_eq!(task["spec"]["inherit_context"], false);
+        // A mock records every request it evaluates, so select this lens explicitly.
+        let requests = mock
+            .requests()
+            .into_iter()
+            .filter(|request| {
+                assigned_review(&request.body_json())
+                    .is_some_and(|text| text.contains(&format!("## Your lens: {title}\n")))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1, "one review request for {lens}");
+        let request = &requests[0];
+        let body = request.body_json();
+        assert_eq!(
+            body["text"]["format"],
+            json!({"name": "codex_output_schema", "type": "json_schema", "strict": true, "schema": schema})
+        );
+        let assignment = assigned_review(&body).context("review assignment")?;
+        // Reviewers read the user's own words, the draft and the reports...
+        assert!(assignment.contains(USER_REQUEST));
+        assert!(assignment.contains(DRAFT));
+        assert!(assignment.contains(CAPTURE_RESULT));
+        // ...not the planner's instructions or a forked coordinator transcript.
+        assert!(!request.body_contains_text("Design the executable workflow"));
+        let declarations = body["tools"].as_array().into_iter().flatten().chain(
+            body["input"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| item["type"] == "additional_tools")
+                .flat_map(|item| item["tools"].as_array().into_iter().flatten()),
+        );
+        for namespace in declarations {
+            for tool in namespace["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(std::iter::once(namespace))
+            {
+                assert!(
+                    !matches!(
+                        tool["name"].as_str(),
+                        Some("workflow" | "spawn_agent" | "send_message" | "followup_task")
+                    ),
+                    "reviewers must not dispatch or redirect work: {tool}"
+                );
+            }
+        }
+        let child_id = assert_native_child(&mut app_server, &root_thread_id, request).await?;
+        assert_eq!(task["agent_id"], child_id);
+    }
     Ok(())
 }

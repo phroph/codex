@@ -244,6 +244,8 @@ pub enum Feature {
     MultiAgentV2,
     /// Execute adaptive, task-specific workflows through the native multi-agent runtime.
     WorkflowOrchestration,
+    /// Run independent lens-specialized acceptance reviewers on a designed workflow's draft answer.
+    WorkflowReview,
     /// Keep spawn model choices in append-only context instead of tool descriptions.
     ModelCatalogInContext,
     /// Inherit client-defined dynamic tools in fresh V2 subagents.
@@ -1609,6 +1611,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         stage: Stage::Experimental {
             name: "Workflow orchestration",
             menu_description: "Coordinate complex work with adaptive groups and task dependencies.",
+            announcement: "",
+        },
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::WorkflowReview,
+        key: "workflow_review",
+        stage: Stage::Experimental {
+            name: "Workflow acceptance review",
+            menu_description: "Check a workflow's draft answer with independent specialist reviewers before it completes.",
             announcement: "",
         },
         default_enabled: true,

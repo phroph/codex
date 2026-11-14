@@ -8,6 +8,9 @@ use std::collections::BTreeSet;
 
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 const MAX_TASKS: usize = 128;
+/// Runtime acceptance reviewers have their own allowance so that review never
+/// makes a large designed workflow impossible to finish (32 reviews of 3 lenses).
+const MAX_REVIEW_TASKS: usize = 96;
 const MAX_PARALLEL: usize = 32;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 
@@ -58,6 +61,8 @@ pub(crate) enum TaskKind {
     #[default]
     Work,
     Design,
+    /// Runtime-owned acceptance review of the coordinator's draft answer.
+    Review,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -75,6 +80,51 @@ pub(crate) struct DesignState {
     pub completion_criteria: Vec<String>,
     pub deferred_decisions: Vec<String>,
     pub assessment: Option<String>,
+    // Omitted while empty so journals of unreviewed workflows stay readable by
+    // builds that predate acceptance review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<ReviewRecord>,
+}
+
+/// One acceptance review of a draft answer. Findings are advisory: blocking and
+/// major findings require a recorded coordinator response, not a pass verdict.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewRecord {
+    /// Design round whose results this draft answer integrates.
+    pub round: u32,
+    /// 1-based review count within the workflow; keeps reviewer task IDs unique.
+    pub attempt: u32,
+    pub assessment: String,
+    pub draft_answer: String,
+    /// The user's own messages from the owner conversation, captured at review start.
+    pub user_messages: Vec<String>,
+    pub standing_instructions: Option<String>,
+    pub task_ids: Vec<String>,
+    pub complete: bool,
+    pub issues: Vec<ReviewIssue>,
+    pub failed_reviewers: Vec<String>,
+    /// Later work, revision or advancement made this review stale.
+    pub superseded: bool,
+    pub response: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReviewSeverity {
+    Blocking,
+    Major,
+    Minor,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewIssue {
+    pub lens: String,
+    pub severity: ReviewSeverity,
+    pub title: String,
+    pub detail: String,
+    pub evidence: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -166,9 +216,21 @@ pub(crate) fn validate_id(id: &str, field: &str) -> Result<(), String> {
 pub(crate) fn validate_plan(plan: &WorkflowPlan) -> Result<(), String> {
     validate_id(&plan.id, "workflow id")?;
     validate_text(&plan.goal, "workflow goal")?;
-    if plan.tasks.is_empty() || plan.tasks.len() > MAX_TASKS {
+    let reviewers = plan
+        .tasks
+        .iter()
+        .filter(|task| task.kind == TaskKind::Review)
+        .count();
+    let tasks = plan.tasks.len() - reviewers;
+    if tasks == 0 || tasks > MAX_TASKS {
         return Err(format!(
             "a workflow must contain between 1 and {MAX_TASKS} tasks"
+        ));
+    }
+    if reviewers > MAX_REVIEW_TASKS {
+        return Err(format!(
+            "a workflow may run at most {} acceptance reviews",
+            MAX_REVIEW_TASKS / 3
         ));
     }
     if plan.max_parallel == 0 || plan.max_parallel > MAX_PARALLEL {

@@ -6,6 +6,7 @@
 pub(crate) mod model;
 mod planning;
 mod progress;
+mod review;
 pub(crate) mod store;
 
 use crate::agent::api::AgentControl;
@@ -70,6 +71,8 @@ pub(crate) struct WorkflowArgs {
     pub remove_task_ids: Vec<String>,
     pub goal: Option<String>,
     pub assessment: Option<String>,
+    pub draft_answer: Option<String>,
+    pub review_response: Option<String>,
     pub max_parallel: Option<usize>,
     #[serde(default)]
     pub task_ids: Vec<String>,
@@ -113,6 +116,11 @@ struct Command {
     remove_task_ids: Vec<String>,
     goal: Option<String>,
     assessment: Option<String>,
+    draft_answer: Option<String>,
+    review_response: Option<String>,
+    /// The user's own messages and standing instructions, captured for review.
+    review_context: Option<(Vec<String>, Option<String>)>,
+    review_enabled: bool,
     max_parallel: Option<usize>,
     task_ids: Vec<String>,
     expected_revision: Option<u64>,
@@ -142,6 +150,7 @@ struct WorkflowActor {
     stop_handled: bool,
     owner_turn: watch::Receiver<String>,
     continued_revision: Option<u64>,
+    review_enabled: bool,
 }
 
 /// Explicit stop also applies when the coordinator is idle but its workflow is
@@ -203,6 +212,11 @@ pub(crate) async fn execute(
         .services
         .thread_extension_data
         .get_or_init(WorkflowManager::default);
+    let review_enabled = step
+        .turn
+        .config
+        .features
+        .enabled(codex_features::Feature::WorkflowReview);
     let codex_home = &step.turn.config.codex_home;
     if args.action == "status" && args.workflow_id.is_none() {
         let mut entries = Vec::new();
@@ -214,9 +228,14 @@ pub(crate) async fn execute(
                 let id = entry.file_name().to_string_lossy().into_owned();
                 if let Ok(store) =
                     WorkflowStore::new(codex_home, &session.thread_id.to_string(), &id)
-                    && let Some(state) = store.load().await?
                 {
-                    entries.push(json!({"id": id, "goal": state.plan.goal, "status": state.status, "revision": state.revision}));
+                    // One unreadable record (for example, from a newer build) must not
+                    // hide every other workflow in this chat.
+                    match store.load().await {
+                        Ok(Some(state)) => entries.push(json!({"id": id, "goal": state.plan.goal, "status": state.status, "revision": state.revision})),
+                        Ok(None) => {}
+                        Err(error) => entries.push(json!({"id": id, "error": error})),
+                    }
                 }
             }
         }
@@ -323,6 +342,7 @@ pub(crate) async fn execute(
             stop_handled: false,
             owner_turn,
             continued_revision: None,
+            review_enabled,
         };
         tokio::spawn(actor.run());
     }
@@ -378,7 +398,27 @@ pub(crate) async fn execute(
         }
         "revise" | "retry" | "pause" | "resume" | "cancel" | "advance" | "finish" => {
             let state = handle.snapshot.borrow().clone();
+            let mut review_context = None;
             let specs = match args.action.as_str() {
+                "finish"
+                    if review_enabled
+                        && state.design.is_some()
+                        && review::awaiting_response(&state).is_none() =>
+                {
+                    // Reviewers read the user's own words, not the coordinator's paraphrase.
+                    let history = session.clone_history().await;
+                    let context = review::user_messages(history.raw_items());
+                    let mut next = state.clone();
+                    let specs = review::begin(
+                        &mut next,
+                        args.assessment.as_deref().unwrap_or(""),
+                        args.draft_answer.as_deref().unwrap_or(""),
+                        context.0.clone(),
+                        context.1.clone(),
+                    )?;
+                    review_context = Some(context);
+                    specs
+                }
                 "revise" => args.tasks.clone(),
                 "advance" => {
                     let mut next = state.clone();
@@ -415,6 +455,10 @@ pub(crate) async fn execute(
                     remove_task_ids: args.remove_task_ids,
                     goal: args.goal,
                     assessment: args.assessment,
+                    draft_answer: args.draft_answer,
+                    review_response: args.review_response,
+                    review_context,
+                    review_enabled,
                     max_parallel: args.max_parallel,
                     task_ids: args.task_ids,
                     expected_revision: args.expected_revision,
@@ -445,7 +489,12 @@ pub(crate) async fn execute(
     );
     handle.owner_turn.send_replace(step.turn.sub_id.clone());
     progress::publish(&session, &step.turn.sub_id).await;
-    Ok(view(&state, &handle.directory, args.include_outputs))
+    Ok(view(
+        &state,
+        &handle.directory,
+        args.include_outputs,
+        review_enabled,
+    ))
 }
 
 fn native_task_name(workflow_id: &str, task_id: &str, attempt: u32) -> String {
@@ -477,6 +526,12 @@ async fn prepare_tasks(
     for task in specs {
         let attempt = state.tasks.get(&task.id).map_or(1, |t| t.attempt + 1);
         let task_name = native_task_name(&state.plan.id, &task.id, attempt);
+        // A configured reviewer role can tier reviewers (for example, higher effort
+        // than the workers) without relying on the coordinator to request it.
+        let agent_type = (task.kind == TaskKind::Review
+            && crate::agent::role::resolve_role_config(&step.turn.config, review::REVIEWER_ROLE)
+                .is_some())
+        .then(|| review::REVIEWER_ROLE.to_string());
         let (mut settings, path) = crate::thread_spawn::prepare(
             session,
             step,
@@ -486,13 +541,32 @@ async fn prepare_tasks(
                 fork_mode: task
                     .inherit_context
                     .then_some(SpawnAgentForkMode::FullHistory),
-                agent_type: None,
+                agent_type,
                 model: task.model.clone(),
                 reasoning_effort: task.reasoning_effort.clone(),
             },
         )
         .await
         .map_err(|e| e.to_string())?;
+        if task.kind == TaskKind::Review {
+            settings.options.final_output_json_schema = Some(review::output_schema());
+            settings
+                .config
+                .features
+                .disable(codex_features::Feature::WorkflowOrchestration)
+                .map_err(|error| error.to_string())?;
+            settings.config.multi_agent_v2.disable_native_tools = true;
+            // Reviewers inspect; they never change what they are reviewing. Managed
+            // constraints may pin the session profile, in which case the prompt's
+            // read-only instruction is the remaining safeguard.
+            if let Err(error) = settings
+                .config
+                .permissions
+                .set_permission_profile(codex_protocol::models::PermissionProfile::read_only())
+            {
+                tracing::warn!(%error, "workflow reviewer kept the inherited permission profile");
+            }
+        }
         if task.kind == TaskKind::Design {
             settings.options.final_output_json_schema = Some(planning::output_schema());
             // Planning uses the owner's native context and model, but cannot recursively
@@ -518,11 +592,30 @@ async fn prepare_tasks(
     Ok(prepared)
 }
 
-fn view(state: &WorkflowState, directory: &std::path::Path, include_outputs: bool) -> Value {
+fn view(
+    state: &WorkflowState,
+    directory: &std::path::Path,
+    include_outputs: bool,
+    review_enabled: bool,
+) -> Value {
     let mut result = serde_json::to_value(state).unwrap_or(Value::Null);
     if let Some(plan) = result.get_mut("plan").and_then(Value::as_object_mut) {
         // Avoid repeating every prompt twice on each progress observation.
         plan.remove("tasks");
+    }
+    if !include_outputs
+        && let Some(reviews) = result
+            .pointer_mut("/design/reviews")
+            .and_then(Value::as_array_mut)
+    {
+        // The coordinator already holds these inputs; keep status bounded.
+        for review in reviews {
+            if let Some(review) = review.as_object_mut() {
+                for key in ["user_messages", "standing_instructions", "draft_answer"] {
+                    review.remove(key);
+                }
+            }
+        }
     }
     if let Some(tasks) = result.get_mut("tasks").and_then(Value::as_object_mut) {
         for (id, task) in tasks {
@@ -531,6 +624,11 @@ fn view(state: &WorkflowState, directory: &std::path::Path, include_outputs: boo
                     "output_path".into(),
                     json!(directory.join("outputs").join(format!("{id}.txt"))),
                 );
+            }
+            if state.tasks[id].spec.kind == TaskKind::Review
+                && let Some(spec) = task.get_mut("spec").and_then(Value::as_object_mut)
+            {
+                spec.remove("prompt");
             }
             if state.tasks[id].spec.kind == TaskKind::Design {
                 if let Some(spec) = task.get_mut("spec").and_then(Value::as_object_mut) {
@@ -572,9 +670,12 @@ fn view(state: &WorkflowState, directory: &std::path::Path, include_outputs: boo
             }
         }
     }
+    let next_action = review::coordinator_hint(state, review_enabled).or_else(|| {
+        (state.status == RunStatus::AwaitingDecision).then(|| "Inspect reports against design.completion_criteria. Call advance with assessment to design remaining work from actual findings, or finish with assessment when the objective is handled. Do not finish merely because workers returned.".to_string())
+    });
     json!({"state": result, "directory": directory,
-        "next_action": if state.status == RunStatus::AwaitingDecision { Some("Inspect reports against design.completion_criteria. Call advance with assessment to design remaining work from actual findings, or finish with assessment when the objective is handled. Do not finish merely because workers returned.") } else { None },
-        "note": "Task completion means a report returned. Designed workflows require a coordinator finish assessment before the workflow is completed. Full designs, reports and revisions are retained in directory."})
+        "next_action": next_action,
+        "note": "Task completion means a report returned. Designed workflows require a coordinator finish assessment before the workflow is completed. Full designs, reports, reviews and revisions are retained in directory."})
 }
 
 fn excerpt(text: &str, limit: usize) -> String {
@@ -589,6 +690,9 @@ fn excerpt(text: &str, limit: usize) -> String {
 
 fn task_prompt(state: &WorkflowState, id: &str, directory: &std::path::Path) -> String {
     let task = &state.tasks[id].spec;
+    if task.kind == TaskKind::Review {
+        return review::prompt(state, id, directory);
+    }
     let mut prompt = format!(
         "You are executing task '{}' in native workflow '{}'.\nOverall objective: {}\nTask: {}\n",
         task.id, state.plan.id, state.plan.goal, task.prompt
@@ -860,10 +964,17 @@ impl WorkflowActor {
 
     async fn settle(&mut self) -> Result<(), String> {
         let mut next = self.state.clone();
-        let changed = model::reconcile_blocked(&mut next);
+        let changed = model::reconcile_blocked(&mut next) | review::collect(&mut next);
         let finished = next.tasks.values().all(|t| model::is_terminal(t.status));
         if finished && next.status == RunStatus::Running {
-            next.status = if planning::execution_succeeded(&next) {
+            next.status = if review::awaiting_response(&next).is_some() {
+                // Returned findings, including failed reviewers, go to the coordinator.
+                RunStatus::AwaitingDecision
+            } else if let Some(message) = review::stalled_message(&next) {
+                // Interrupted reviewers never count as a completed review.
+                next.last_error = Some(message);
+                RunStatus::NeedsAttention
+            } else if planning::execution_succeeded(&next) {
                 if next.design.is_some() {
                     RunStatus::AwaitingDecision
                 } else {
@@ -1012,8 +1123,13 @@ impl WorkflowActor {
             _ => {}
         }
         let mut next = self.state.clone();
+        self.review_enabled = command.review_enabled;
+        // Running reviewers of a review that later work made stale.
+        let mut stale_reviewers = Vec::new();
         match command.action.as_str() {
             "revise" => {
+                // Changed work changes what would be delivered; review that draft afresh.
+                stale_reviewers = review::supersede(&mut next);
                 let mut tasks = command.tasks.clone();
                 if next.design.is_some() {
                     planning::prepare_revision(
@@ -1039,13 +1155,39 @@ impl WorkflowActor {
                 planning::advance(&mut next, command.assessment.as_deref().unwrap_or(""))?;
             }
             "finish" => {
-                planning::finish(&mut next, command.assessment.as_deref().unwrap_or(""))?;
-                self.observed_terminal.store(true, Ordering::Release);
-                return self.commit(next, "finished_by_coordinator").await;
+                if review::awaiting_response(&next).is_some() {
+                    review::respond_and_finish(
+                        &mut next,
+                        command.assessment.as_deref().unwrap_or(""),
+                        command.review_response.as_deref(),
+                    )?;
+                    self.observed_terminal.store(true, Ordering::Release);
+                    return self.commit(next, "finished_after_review").await;
+                }
+                if command.review_enabled && next.design.is_some() {
+                    // Never complete unreviewed because the snapshot changed mid-call.
+                    let (messages, standing) = command.review_context.clone().ok_or(
+                        "Workflow changed while finishing; read status and call finish again",
+                    )?;
+                    review::begin(
+                        &mut next,
+                        command.assessment.as_deref().unwrap_or(""),
+                        command.draft_answer.as_deref().unwrap_or(""),
+                        messages,
+                        standing,
+                    )?;
+                } else {
+                    planning::finish(&mut next, command.assessment.as_deref().unwrap_or(""))?;
+                    self.observed_terminal.store(true, Ordering::Release);
+                    return self.commit(next, "finished_by_coordinator").await;
+                }
             }
             "retry" => {
                 let affected = model::reset_tasks(&mut next, &command.task_ids)?;
                 self.ensure_attempts_stopped(&affected).await?;
+                if !review::reopen_for_retry(&mut next, &command.task_ids) {
+                    stale_reviewers = review::supersede(&mut next);
+                }
             }
             "resume" => {
                 if next.status == RunStatus::Cancelled {
@@ -1063,7 +1205,23 @@ impl WorkflowActor {
                 None
             };
         }
-        self.commit(next, &command.action).await?;
+        let event = if command.action == "finish" {
+            "acceptance_review_started"
+        } else {
+            command.action.as_str()
+        };
+        self.commit(next, event).await?;
+        for agent_id in stale_reviewers {
+            // Their findings would review a superseded draft; free their capacity.
+            if let Ok(id) = ThreadId::from_string(&agent_id)
+                && let Err(error) = self
+                    .control
+                    .interrupt(self.owner_id, AgentTarget::Id(id), MultiAgentVersion::V2)
+                    .await
+            {
+                tracing::debug!(%error, "superseded reviewer could not be interrupted");
+            }
+        }
         self.prepared.extend(command.prepared.clone());
         self.design_step = command.step.clone();
         self.stop_requested.store(false, Ordering::Release);
@@ -1227,8 +1385,11 @@ impl WorkflowActor {
         else {
             return;
         };
+        let hint = review::coordinator_hint(&self.state, self.review_enabled)
+            .map(|hint| format!(" {hint}"))
+            .unwrap_or_default();
         let text = format!(
-            "<workflow_status>\nWorkflow {} is {:?} at revision {}. Use workflow status with workflow_id {} to inspect results. At AwaitingDecision, assess completion criteria and deferred decisions; advance with findings to design remaining work, or finish with an explicit assessment. Worker completion alone does not close the objective. Records: {}\n</workflow_status>",
+            "<workflow_status>\nWorkflow {} is {:?} at revision {}. Use workflow status with workflow_id {} to inspect results. At AwaitingDecision, assess completion criteria and deferred decisions; advance with findings to design remaining work, or finish with an explicit assessment. Worker completion alone does not close the objective.{hint} Records: {}\n</workflow_status>",
             self.state.plan.id,
             self.state.status,
             self.state.revision,
@@ -1268,8 +1429,11 @@ impl WorkflowActor {
             return;
         };
         self.continued_revision = Some(self.state.revision);
+        let hint = review::coordinator_hint(&self.state, self.review_enabled)
+            .map(|hint| format!(" {hint}"))
+            .unwrap_or_default();
         let summary = format!(
-            "Native workflow {} is {:?}. Its work finished after your last response. Inspect workflow status and actual reports against the completion criteria. At AwaitingDecision, call advance with your assessment if results require further work, or finish with your assessment when the objective is handled, then provide the user's result. This continues the existing task, not new user authorization. Records: {}",
+            "Native workflow {} is {:?}. Its work finished after your last response. Inspect workflow status and actual reports against the completion criteria. At AwaitingDecision, call advance with your assessment if results require further work, or finish with your assessment when the objective is handled, then provide the user's result.{hint} This continues the existing task, not new user authorization. Records: {}",
             self.state.plan.id,
             self.state.status,
             self.store.directory().display()
