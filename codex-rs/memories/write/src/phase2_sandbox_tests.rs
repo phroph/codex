@@ -1,4 +1,5 @@
 use super::agent;
+use codex_features::Feature;
 use codex_model_provider::create_model_provider;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
@@ -60,6 +61,19 @@ async fn consolidation_uses_canonical_parent_enforcement() -> anyhow::Result<()>
             agent_config.permissions.permission_profile(),
             &expected_permission_profile
         );
+        // Consolidation must not delegate: no agent tools from any source, and no
+        // native workflows (which could not plan from an internal thread anyway).
+        assert!(!agent_config.agents_enabled);
+        for feature in [
+            Feature::Collab,
+            Feature::MultiAgentV2,
+            Feature::WorkflowOrchestration,
+        ] {
+            assert!(
+                !agent_config.features.enabled(feature),
+                "{feature:?} must be disabled for consolidation"
+            );
+        }
     }
 
     test.codex.shutdown_and_wait().await?;

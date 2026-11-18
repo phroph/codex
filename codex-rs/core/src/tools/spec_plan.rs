@@ -1520,6 +1520,10 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 .config
                 .features
                 .enabled(Feature::WorkflowOrchestration)
+                && crate::workflow::workflows_supported(
+                    &turn_context.session_source,
+                    turn_context.config.ephemeral,
+                )
             {
                 registry.register_trusted_with_native_review(
                     multi_agent_v2_handler(

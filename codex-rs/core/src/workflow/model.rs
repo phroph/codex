@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 const MAX_TASKS: usize = 128;
 /// Runtime acceptance reviewers have their own allowance so that review never
-/// makes a large designed workflow impossible to finish (32 reviews of 3 lenses).
-const MAX_REVIEW_TASKS: usize = 96;
+/// makes a large designed workflow impossible to finish.
+pub(crate) const MAX_REVIEW_TASKS: usize = 128;
 const MAX_PARALLEL: usize = 32;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 
@@ -107,6 +107,29 @@ pub(crate) struct ReviewRecord {
     /// Later work, revision or advancement made this review stale.
     pub superseded: bool,
     pub response: Option<String>,
+    // Fields below were added after the first review build; defaults keep its
+    // records loadable, and defaults are omitted when writing.
+    #[serde(default, skip_serializing_if = "ReviewKind::is_full")]
+    pub kind: ReviewKind,
+    /// The exact answer the coordinator delivers after answering this review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_answer: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReviewKind {
+    /// Lens review of the coordinator's draft answer.
+    #[default]
+    Full,
+    /// Review of what changed between a reviewed draft and the answer delivered.
+    Delta,
+}
+
+impl ReviewKind {
+    fn is_full(&self) -> bool {
+        *self == ReviewKind::Full
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -229,8 +252,7 @@ pub(crate) fn validate_plan(plan: &WorkflowPlan) -> Result<(), String> {
     }
     if reviewers > MAX_REVIEW_TASKS {
         return Err(format!(
-            "a workflow may run at most {} acceptance reviews",
-            MAX_REVIEW_TASKS / 3
+            "a workflow may run at most {MAX_REVIEW_TASKS} acceptance reviewer tasks"
         ));
     }
     if plan.max_parallel == 0 || plan.max_parallel > MAX_PARALLEL {
@@ -371,33 +393,42 @@ pub(super) fn dependency_ready(state: &WorkflowState, spec: &TaskSpec, id: &str)
                 }))))
 }
 
+/// Running tasks that count against `max_parallel`. Acceptance reviewers run as
+/// one panel outside that limit, so a narrow limit never serializes the lenses.
+pub(crate) fn running_work(state: &WorkflowState) -> usize {
+    state
+        .tasks
+        .values()
+        .filter(|task| task.status == TaskStatus::Running && task.spec.kind != TaskKind::Review)
+        .count()
+}
+
 pub(crate) fn ready_tasks(state: &WorkflowState) -> Vec<String> {
     if state.status != RunStatus::Running {
         return Vec::new();
     }
-    let running = state
-        .tasks
-        .values()
-        .filter(|task| task.status == TaskStatus::Running)
-        .count();
-    let capacity = state.plan.max_parallel.saturating_sub(running);
-    state
-        .plan
-        .tasks
-        .iter()
-        .filter(|spec| {
-            state
-                .tasks
-                .get(&spec.id)
-                .is_some_and(|task| task.status == TaskStatus::Pending)
-                && spec
-                    .depends_on
-                    .iter()
-                    .all(|id| dependency_ready(state, spec, id))
-        })
-        .take(capacity)
-        .map(|spec| spec.id.clone())
-        .collect()
+    let mut capacity = state.plan.max_parallel.saturating_sub(running_work(state));
+    let mut ready = Vec::new();
+    for spec in &state.plan.tasks {
+        let runnable = state
+            .tasks
+            .get(&spec.id)
+            .is_some_and(|task| task.status == TaskStatus::Pending)
+            && spec
+                .depends_on
+                .iter()
+                .all(|id| dependency_ready(state, spec, id));
+        if !runnable {
+            continue;
+        }
+        if spec.kind == TaskKind::Review {
+            ready.push(spec.id.clone());
+        } else if capacity > 0 {
+            capacity -= 1;
+            ready.push(spec.id.clone());
+        }
+    }
+    ready
 }
 
 /// Propagate failed dependencies, but leave explicitly designated failure handlers runnable.

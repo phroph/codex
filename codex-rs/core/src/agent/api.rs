@@ -138,6 +138,12 @@ pub trait AgentControl: Send + Sync {
     /// This reads existing membership without registering the parent or loading children.
     fn child_agent_paths(&self, parent: ThreadId) -> BoxFuture<'_, Vec<AgentPath>>;
 
+    /// The registered task path of an agent, including agents restored but not
+    /// loaded. Backends without a registry report none.
+    fn agent_path(&self, _agent: ThreadId) -> Option<AgentPath> {
+        None
+    }
+
     /// Check capacity before accepting work. This advisory check does not reserve a slot.
     fn check_turn_admission(
         &self,

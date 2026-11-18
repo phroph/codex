@@ -329,7 +329,15 @@ mod agent {
         // Approval policy
         agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
         // Consolidation runs as an internal worker and must not recursively delegate.
+        // Disabling features alone is not enough: with agents enabled, the model
+        // catalog's multi-agent version still applies. `agents_enabled = false`
+        // resolves the version to Disabled ahead of the catalog.
+        agent_config.agents_enabled = false;
         let _ = agent_config.features.disable(Feature::Collab);
+        let _ = agent_config.features.disable(Feature::MultiAgentV2);
+        let _ = agent_config
+            .features
+            .disable(Feature::WorkflowOrchestration);
         let _ = agent_config.features.disable(Feature::MemoryTool);
         let _ = agent_config.features.disable(Feature::Apps);
         let _ = agent_config.features.disable(Feature::Plugins);

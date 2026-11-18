@@ -73,6 +73,7 @@ pub(crate) struct WorkflowArgs {
     pub assessment: Option<String>,
     pub draft_answer: Option<String>,
     pub review_response: Option<String>,
+    pub final_answer: Option<String>,
     pub max_parallel: Option<usize>,
     #[serde(default)]
     pub task_ids: Vec<String>,
@@ -118,6 +119,7 @@ struct Command {
     assessment: Option<String>,
     draft_answer: Option<String>,
     review_response: Option<String>,
+    final_answer: Option<String>,
     /// The user's own messages and standing instructions, captured for review.
     review_context: Option<(Vec<String>, Option<String>)>,
     review_enabled: bool,
@@ -186,6 +188,48 @@ pub(crate) async fn interrupt_owner(session: &Session) -> bool {
     affected
 }
 
+/// Native workflows need a user-owned conversation whose history can be forked
+/// for the planner. Internal threads (such as memory consolidation) are hidden
+/// from thread lookup and ephemeral threads have no persisted rollout, so both
+/// would fail at planning after writing a record. Sub-agents, including workflow
+/// workers, do not own a workflow either: a worker's report would be captured
+/// before its nested workflow finished. None of these are offered the tool.
+pub(crate) fn workflows_supported(
+    source: &codex_protocol::protocol::SessionSource,
+    ephemeral: bool,
+) -> bool {
+    !source.is_non_root_agent() && !ephemeral
+}
+
+/// Acceptance reviewers must stay independent of the coordinator that authored
+/// the work: they are not messaged, steered or reassigned once dispatched, by
+/// any agent. The decision is made from the receiver's own registered path, so
+/// it holds for proxies, other sessions and reviewers restored after a restart.
+pub(crate) async fn is_workflow_reviewer(session: &Session, agent: ThreadId) -> bool {
+    if session
+        .services
+        .agent_control
+        .agent_path(agent)
+        .is_some_and(|path| is_reviewer_agent_path(path.as_str()))
+    {
+        return true;
+    }
+    let Some(manager) = session
+        .services
+        .thread_extension_data
+        .get::<WorkflowManager>()
+    else {
+        return false;
+    };
+    let agent = agent.to_string();
+    manager
+        .handles
+        .lock()
+        .await
+        .values()
+        .any(|handle| review::is_reviewer_agent(&handle.snapshot.borrow(), &agent))
+}
+
 pub(crate) async fn execute(
     session: Arc<Session>,
     step: Arc<StepContext>,
@@ -193,6 +237,11 @@ pub(crate) async fn execute(
     args: WorkflowArgs,
     cancellation: CancellationToken,
 ) -> Result<Value, String> {
+    if args.action == "start"
+        && !workflows_supported(&step.turn.session_source, step.turn.config.ephemeral)
+    {
+        return Err("Native workflows need a persisted, user-owned conversation. This thread is internal or ephemeral, so its history cannot be forked for the planner; do the work directly.".into());
+    }
     if !matches!(
         args.action.as_str(),
         "start"
@@ -400,6 +449,25 @@ pub(crate) async fn execute(
             let state = handle.snapshot.borrow().clone();
             let mut review_context = None;
             let specs = match args.action.as_str() {
+                "finish" if review::awaiting_response(&state).is_some() => {
+                    // Validate now so mistakes return to the model before dispatch; a
+                    // changed final answer yields the delta reviewer to prepare, which
+                    // reads the user's messages as they are now.
+                    let history = session.clone_history().await;
+                    let context = review::user_messages(history.raw_items());
+                    let mut next = state.clone();
+                    let specs = review::respond(
+                        &mut next,
+                        args.assessment.as_deref().unwrap_or(""),
+                        args.review_response.as_deref(),
+                        args.final_answer.as_deref(),
+                        review_enabled,
+                        Some(context.clone()),
+                    )?
+                    .unwrap_or_default();
+                    review_context = Some(context);
+                    specs
+                }
                 "finish"
                     if review_enabled
                         && state.design.is_some()
@@ -457,6 +525,7 @@ pub(crate) async fn execute(
                     assessment: args.assessment,
                     draft_answer: args.draft_answer,
                     review_response: args.review_response,
+                    final_answer: args.final_answer,
                     review_context,
                     review_enabled,
                     max_parallel: args.max_parallel,
@@ -497,22 +566,36 @@ pub(crate) async fn execute(
     ))
 }
 
-fn native_task_name(workflow_id: &str, task_id: &str, attempt: u32) -> String {
-    // Workflow IDs allow uppercase letters and hyphens; native agent names do
-    // not. Escape underscores too, so distinct IDs never collapse to one path.
-    // Encoded components cannot contain `__`, which separates their boundaries.
-    let encode = |id: &str| {
-        let mut encoded = String::new();
-        for byte in id.bytes() {
-            if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
-                encoded.push(char::from(byte));
-            } else {
-                encoded.push_str(&format!("_{byte:02x}"));
-            }
+/// Workflow IDs allow uppercase letters and hyphens; native agent names do
+/// not. Escape underscores too, so distinct IDs never collapse to one path.
+/// Encoded components cannot contain `__`, which separates their boundaries.
+fn encode_name_component(id: &str) -> String {
+    let mut encoded = String::new();
+    for byte in id.bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("_{byte:02x}"));
         }
-        encoded
-    };
-    format!("wf_{}__{}__{attempt}", encode(workflow_id), encode(task_id))
+    }
+    encoded
+}
+
+fn native_task_name(workflow_id: &str, task_id: &str, attempt: u32) -> String {
+    format!(
+        "wf_{}__{}__{attempt}",
+        encode_name_component(workflow_id),
+        encode_name_component(task_id)
+    )
+}
+
+/// Whether a native agent path belongs to a workflow acceptance reviewer. Only
+/// the runtime creates `_review_` tasks, and because encoded components never
+/// contain `__`, the encoded prefix can only follow a component boundary.
+pub(crate) fn is_reviewer_agent_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.starts_with("wf_")
+        && name.contains(&format!("__{}", encode_name_component(review::TASK_PREFIX)))
 }
 
 async fn prepare_tasks(
@@ -611,7 +694,12 @@ fn view(
         // The coordinator already holds these inputs; keep status bounded.
         for review in reviews {
             if let Some(review) = review.as_object_mut() {
-                for key in ["user_messages", "standing_instructions", "draft_answer"] {
+                for key in [
+                    "user_messages",
+                    "standing_instructions",
+                    "draft_answer",
+                    "final_answer",
+                ] {
                     review.remove(key);
                 }
             }
@@ -856,16 +944,11 @@ impl WorkflowActor {
             return Ok(false);
         }
         loop {
-            let running = self
-                .state
-                .tasks
-                .values()
-                .filter(|t| t.status == TaskStatus::Running)
-                .count();
-            if running >= self.state.plan.max_parallel {
-                return Ok(false);
-            }
+            // Reviewers run as one panel outside max_parallel (see ready_tasks).
             let Some(id) = model::ready_tasks(&self.state).first().cloned() else {
+                if model::running_work(&self.state) >= self.state.plan.max_parallel {
+                    return Ok(false);
+                }
                 break;
             };
             let Some(prepared) = self.prepared.get(&id).cloned() else {
@@ -1126,10 +1209,22 @@ impl WorkflowActor {
         self.review_enabled = command.review_enabled;
         // Running reviewers of a review that later work made stale.
         let mut stale_reviewers = Vec::new();
+        let mut finish_event = "acceptance_review_started";
         match command.action.as_str() {
             "revise" => {
-                // Changed work changes what would be delivered; review that draft afresh.
-                stale_reviewers = review::supersede(&mut next);
+                // Changed work or a changed objective changes what would be delivered,
+                // so that draft is reviewed afresh. A concurrency change alone is not.
+                let goal_changed = command
+                    .goal
+                    .as_ref()
+                    .is_some_and(|goal| goal != &next.plan.goal);
+                if review::revision_supersedes(
+                    !command.tasks.is_empty(),
+                    !command.remove_task_ids.is_empty(),
+                    goal_changed,
+                ) {
+                    stale_reviewers = review::supersede(&mut next);
+                }
                 let mut tasks = command.tasks.clone();
                 if next.design.is_some() {
                     planning::prepare_revision(
@@ -1156,15 +1251,21 @@ impl WorkflowActor {
             }
             "finish" => {
                 if review::awaiting_response(&next).is_some() {
-                    review::respond_and_finish(
+                    let delta = review::respond(
                         &mut next,
                         command.assessment.as_deref().unwrap_or(""),
                         command.review_response.as_deref(),
+                        command.final_answer.as_deref(),
+                        command.review_enabled,
+                        command.review_context.clone(),
                     )?;
-                    self.observed_terminal.store(true, Ordering::Release);
-                    return self.commit(next, "finished_after_review").await;
-                }
-                if command.review_enabled && next.design.is_some() {
+                    if delta.is_none() {
+                        self.observed_terminal.store(true, Ordering::Release);
+                        return self.commit(next, "finished_after_review").await;
+                    }
+                    // The delivered text changed after review; run the delta reviewer.
+                    finish_event = "delta_review_started";
+                } else if command.review_enabled && next.design.is_some() {
                     // Never complete unreviewed because the snapshot changed mid-call.
                     let (messages, standing) = command.review_context.clone().ok_or(
                         "Workflow changed while finishing; read status and call finish again",
@@ -1206,7 +1307,7 @@ impl WorkflowActor {
             };
         }
         let event = if command.action == "finish" {
-            "acceptance_review_started"
+            finish_event
         } else {
             command.action.as_str()
         };

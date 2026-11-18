@@ -2965,6 +2965,44 @@ async fn workflow_requires_its_feature_and_native_v2_tools() {
     }
 }
 
+/// Workflows need a user-owned, persisted thread: internal threads cannot be
+/// forked for the planner, ephemeral threads have no rollout, and a worker's
+/// report would be captured before a nested workflow finished.
+#[tokio::test]
+async fn workflow_is_offered_only_to_persisted_user_owned_threads() {
+    let workflow_name = ToolName::namespaced("workflows", "workflow").to_string();
+    for (case, expected) in [
+        ("root", true),
+        ("ephemeral", false),
+        ("internal", false),
+        ("sub_agent", false),
+    ] {
+        let plan = probe(|turn| {
+            set_feature(turn, Feature::MultiAgentV2, true);
+            set_feature(turn, Feature::WorkflowOrchestration, true);
+            match case {
+                "ephemeral" => update_config(turn, |config| config.ephemeral = true),
+                "internal" => {
+                    turn.session_source = SessionSource::Internal(
+                        codex_protocol::protocol::InternalSessionSource::MemoryConsolidation,
+                    );
+                }
+                "sub_agent" => {
+                    turn.session_source =
+                        SessionSource::SubAgent(SubAgentSource::Other("workflow worker".into()));
+                }
+                _ => {}
+            }
+        })
+        .await;
+        if expected {
+            plan.assert_registered_contains(&[&workflow_name]);
+        } else {
+            plan.assert_registered_lacks(&[&workflow_name, "workflow"]);
+        }
+    }
+}
+
 #[tokio::test]
 async fn workflow_namespace_is_independent_of_reserved_multi_agent_namespace() {
     for configured_namespace in [None, Some("agents")] {
@@ -3213,15 +3251,14 @@ async fn multi_agent_v2_bedrock_workers_only_delegate_when_model_supports_v2() {
         assert_eq!(plan.can_manage_children, supports_delegation);
         if supports_delegation {
             plan.assert_visible_contains(&["agents"]);
-            plan.assert_registered_contains(&[
-                &spawn_agent_name,
-                &followup_task_name,
-                &workflow_name,
-            ]);
+            plan.assert_registered_contains(&[&spawn_agent_name, &followup_task_name]);
         } else {
             plan.assert_visible_lacks(&["agents"]);
-            plan.assert_registered_lacks(&[&spawn_agent_name, &followup_task_name, &workflow_name]);
+            plan.assert_registered_lacks(&[&spawn_agent_name, &followup_task_name]);
         }
+        // Workers may delegate, but never own a native workflow: their report
+        // would be captured before a nested workflow finished.
+        plan.assert_registered_lacks(&[&workflow_name]);
     }
 }
 

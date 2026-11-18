@@ -55,6 +55,11 @@ pub(super) async fn handle_message_string_tool(
         ..
     } = invocation;
     let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
+    if crate::workflow::is_workflow_reviewer(&session, receiver_thread_id).await {
+        return Err(FunctionCallError::RespondToModel(
+            "That agent is a workflow acceptance reviewer. Reviewers stay independent of the coordinator: do not message, steer or reassign them. Read their findings with workflow status; for new work, spawn a worker or revise the workflow.".to_string(),
+        ));
+    }
     analytics.set_receiver(receiver_thread_id);
     let resume_config =
         build_agent_resume_config(&turn).map_err(FunctionCallError::RespondToModel)?;

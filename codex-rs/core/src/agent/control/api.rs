@@ -274,6 +274,13 @@ impl AgentControl for LocalAgentControl {
         })
     }
 
+    fn agent_path(&self, agent: ThreadId) -> Option<AgentPath> {
+        self.runtime
+            .registry
+            .agent_metadata_for_thread(agent)
+            .and_then(|metadata| metadata.agent_path)
+    }
+
     fn child_agent_paths(&self, parent: ThreadId) -> BoxFuture<'_, Vec<AgentPath>> {
         Box::pin(async move {
             let Some(parent_path) = self
