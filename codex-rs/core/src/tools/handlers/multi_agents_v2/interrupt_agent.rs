@@ -58,7 +58,11 @@ async fn handle_interrupt_agent(
     let agent_path = snapshot.metadata().agent_path.clone().ok_or_else(|| {
         FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
     })?;
-    let previous_status = snapshot.status().cloned().unwrap_or(AgentStatus::NotFound);
+    // Workflow reviewer findings are withheld until their panel returns.
+    let previous_status = crate::workflow::reported_agent_status(
+        agent_path.as_str(),
+        &snapshot.status().cloned().unwrap_or(AgentStatus::NotFound),
+    );
     emit_sub_agent_activity(
         &session,
         &turn,

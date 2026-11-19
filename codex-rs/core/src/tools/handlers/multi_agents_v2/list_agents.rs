@@ -58,14 +58,20 @@ impl Handler {
 
         let agents = agents
             .into_iter()
-            .map(|agent| ListedAgent {
-                agent_name: agent
+            .map(|agent| {
+                let agent_name = agent
                     .metadata
                     .agent_path
                     .as_ref()
                     .map(ToString::to_string)
-                    .unwrap_or_else(|| agent.thread_id.to_string()),
-                agent_status: agent.status,
+                    .unwrap_or_else(|| agent.thread_id.to_string());
+                // Workflow reviewer findings are withheld until their panel returns.
+                let agent_status =
+                    crate::workflow::reported_agent_status(&agent_name, &agent.status);
+                ListedAgent {
+                    agent_name,
+                    agent_status,
+                }
             })
             .collect();
         Ok(boxed_tool_output(ListAgentsResult { agents }))

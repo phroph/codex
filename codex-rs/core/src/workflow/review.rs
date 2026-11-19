@@ -24,7 +24,9 @@ use super::model::TaskStatus;
 use super::model::WorkflowState;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde_json::Value;
@@ -66,6 +68,19 @@ const COMPACTED_NOTE: &str =
     "[earlier conversation was compacted; its oldest user messages may be missing from this list]";
 /// Marker of injected AGENTS.md instructions (`UserInstructions::type_markers`).
 const AGENTS_MD_MARKER: &str = "# AGENTS.md instructions";
+/// The coordinator's recent user-visible messages given to reviewers, so they
+/// can see what was already told to and tried with the user.
+const MAX_COORDINATOR_MESSAGES: usize = 12;
+const MAX_COORDINATOR_MESSAGE_CHARS: usize = 1_500;
+/// The native tool a coordinator uses to message the user while work continues.
+const SEND_TO_USER_TOOL: &str = "send_message_to_user_async";
+/// Values listed for a delta reviewer as dropped from the reviewed text.
+const MAX_DROPPED_VALUES: usize = 60;
+/// A reviewed sentence counts as dropped when fewer than this share of its
+/// content words remain anywhere in the final answer.
+const DROPPED_SENTENCE_OVERLAP: f64 = 0.5;
+const MAX_DROPPED_SENTENCES: usize = 15;
+const MAX_DROPPED_SENTENCE_CHARS: usize = 300;
 
 pub(super) struct Lens {
     pub key: &'static str,
@@ -91,7 +106,7 @@ pub(super) const LENSES: [Lens; 4] = [
         key: "sufficiency",
         title: "Evidence sufficiency and stopping rules",
         instructions: r#"- When the conclusion depends on observing an intermittent event, compare the observation window with the event's base rate and compute how likely the window was to catch it. Flag any monitoring, capture or test that was stopped on a clean window when only a positive observation could settle the question, and say what should have been left running.
-- Identify the decisive discriminator the answer itself names as missing. Check whether every available way to obtain it was tried (other vantage points, other devices on the path, other logs) before it was declared unavailable or handed back to the user.
+- Identify the decisive discriminator the answer itself names as missing. Check whether every available way to obtain it was tried (other vantage points, other devices on the path, other logs) before it was declared unavailable or handed back to the user. When a blocker is handed to the user, name any other device, log or path the agent could have used itself to get past it.
 - List alternative explanations the evidence does not exclude, including any the user raised earlier, any the collected evidence itself hints at, and common causes in the components on the path. For each, say whether the answer excluded it with evidence.
 - Check for positive and negative controls: would the query, probe or test have found the thing if it were there?"#,
     },
@@ -108,18 +123,27 @@ pub(super) const LENSES: [Lens; 4] = [
         title: "User intent, direction and actionability",
         instructions: r#"- List the user's standing directives from anywhere in their messages and standing instructions: the higher-level goal the work serves, priorities, scope limits, quality bars, and things to avoid (for example "do not lose the higher-level thread", "do not over-focus on X", "no ceremony"). A directive stays binding until the user retracts it, however long ago it was stated. Check the draft and any recommended next step against each, and quote the directive a finding conflicts with.
 - Check that the answer measures and reports the quantity the user actually named (their symptom, metric or deliverable), not a nearby proxy that was easier to obtain.
-- Check that the answer is actionable for the user: a clear decision or concrete next steps. A scope the coordinator set for itself (for example "diagnosis only") does not limit what the user needs; only the user's own words do.
+- Check that the answer is actionable for the user: a clear decision or concrete next steps. A scope the coordinator set for itself (for example "diagnosis only") does not limit what the user needs; only the user's own words do. "Wait for it to happen again" or "monitor and report back" is not actionable on its own: ask what the user can do or decide today, and what the answer means concretely for them (bug, failing hardware, configuration, or something else).
+- Test every recommended next step for feasibility against the conversation, including what the coordinator has already told the user: has the user said it is blocked, failing, already tried or already done? Was the same step already pushed and not worked? Could the agent get past the blocker itself through another device, log or path instead of handing it back? A step that repeats a failed or blocked path, or hands back a blocker the agent could work around, is a major finding.
 - Check whether the work, and the next work it recommends, still serves the user's goal or drifts toward what is convenient, narrow, toy-scale or merely interesting, and whether it proposes process or ceremony the user has rejected.
 - Leave number re-derivation, evidence sufficiency and ask-by-ask coverage to the other lenses; report direction problems."#,
     },
 ];
 
+/// One reviewer applying every lens, for the compact review A/B.
+const COMBINED_LENS: Lens = Lens {
+    key: "combined",
+    title: "All acceptance checks: numbers, sufficiency, coverage and intent",
+    instructions: "Apply each of the following checklists in turn. Where a checklist leaves something to another lens, that lens is yours too.",
+};
+
 const DELTA_LENS: Lens = Lens {
     key: "delta",
     title: "Changes since the reviewed draft",
     instructions: r#"- Compare the FINAL ANSWER with the previously reviewed text. For each correction the coordinator's response claims, check that it is actually present in the final answer.
-- Verify every claim, number, result or recommendation that is new in the final answer against primary evidence, as strictly as the original review would have. New experiments or results added after review are unreviewed until you check them.
-- Flag content the user needs that was in the reviewed text but was dropped or weakened (for example observed time windows, lists of effects, caveats, next steps).
+- Verify every claim, number, result or recommendation that is new in the final answer against primary evidence, as strictly as the original review would have. New experiments or results added after review are unreviewed until you check them. Facts that came from an earlier reviewer (counterexamples, counts, pairings) are claims too, not established facts.
+- Agreement reached with the same method, query or matching rule as the coordinator or an earlier reviewer is not independent verification. Re-derive with a different method, or with the matching tolerance or window stated (events logged a millisecond apart are a pair).
+- Flag content the user needs that was in the reviewed text but was dropped or weakened (for example observed time windows, lists of effects, base rates, caveats, next steps). Check each item of the "Specific values dropped" list above, when there is one.
 - Flag direction problems the changes introduce against the user's standing directives.
 - Do not re-raise findings that the response and the final answer already handle adequately."#,
 };
@@ -200,6 +224,25 @@ pub(super) fn awaiting_response(state: &WorkflowState) -> Option<&ReviewRecord> 
 pub(super) fn in_progress(state: &WorkflowState) -> bool {
     active(state).is_some_and(|review| !review.complete)
 }
+
+/// A reviewer's output stays out of the coordinator's view until its review is
+/// complete, so the coordinator does not act on part of the panel. Field use
+/// showed coordinators posting conclusions from three of four lenses.
+/// A superseded review or a cancelled run never completes its review, so its
+/// returned reviewers are shown: their findings no longer gate anything.
+pub(super) fn withheld(state: &WorkflowState, task_id: &str) -> bool {
+    state.status != RunStatus::Cancelled
+        && is_review_task(task_id)
+        && state.design.as_ref().is_some_and(|design| {
+            design.reviews.iter().any(|review| {
+                !review.complete
+                    && !review.superseded
+                    && review.task_ids.iter().any(|task| task == task_id)
+            })
+        })
+}
+
+pub(super) const WITHHELD_OUTPUT: &str = "Withheld until the whole review panel returns; the merged findings then appear in state.design.reviews.";
 
 /// Mark the current review stale when further work changes what would be
 /// delivered. Its unstarted reviewers are cancelled so they do not hold capacity
@@ -355,12 +398,13 @@ fn queue_review(
 
 /// Queue lens reviewers for the coordinator's draft answer. The workflow keeps
 /// running until they return, then returns to awaiting_decision with findings.
+/// `compact` runs one reviewer applying every lens instead of the panel.
 pub(super) fn begin(
     state: &mut WorkflowState,
     assessment: &str,
     draft_answer: &str,
-    user_messages: Vec<String>,
-    standing_instructions: Option<String>,
+    context: ReviewContext,
+    compact: bool,
 ) -> Result<Vec<TaskSpec>, String> {
     if in_progress(state) {
         return Err(stalled_message(state).unwrap_or_else(|| {
@@ -392,16 +436,15 @@ pub(super) fn begin(
         "draft_answer (the complete answer you intend to give the user; acceptance review checks it before the workflow completes)",
     )?;
     let attempt = next_attempt(state)?;
-    let specs = LENSES
-        .iter()
-        .map(|lens| {
-            reviewer_spec(
-                attempt,
-                lens,
-                "Structured acceptance findings with severity and checked evidence",
-            )
-        })
-        .collect();
+    let deliverable = "Structured acceptance findings with severity and checked evidence";
+    let specs = if compact {
+        vec![reviewer_spec(attempt, &COMBINED_LENS, deliverable)]
+    } else {
+        LENSES
+            .iter()
+            .map(|lens| reviewer_spec(attempt, lens, deliverable))
+            .collect()
+    };
     queue_review(
         state,
         specs,
@@ -410,8 +453,9 @@ pub(super) fn begin(
             attempt,
             assessment: assessment.into(),
             draft_answer: draft_answer.into(),
-            user_messages,
-            standing_instructions,
+            user_messages: context.user_messages,
+            standing_instructions: context.standing_instructions,
+            coordinator_messages: context.coordinator_messages,
             ..Default::default()
         },
     )
@@ -616,7 +660,7 @@ pub(super) fn respond(
     response: Option<&str>,
     final_answer: Option<&str>,
     review_enabled: bool,
-    user_context: Option<(Vec<String>, Option<String>)>,
+    user_context: Option<ReviewContext>,
 ) -> Result<Option<Vec<TaskSpec>>, String> {
     // Answering a review never resumes a paused, cancelled or stopped workflow.
     if state.status != RunStatus::AwaitingDecision {
@@ -686,8 +730,11 @@ pub(super) fn respond(
     }
     // The delivered text changed after review: check the changes, with the
     // user's messages as they are now (they may have steered since the panel).
-    let (user_messages, standing_instructions) =
-        user_context.unwrap_or((previous.user_messages, previous.standing_instructions));
+    let context = user_context.unwrap_or(ReviewContext {
+        user_messages: previous.user_messages,
+        standing_instructions: previous.standing_instructions,
+        coordinator_messages: previous.coordinator_messages,
+    });
     let attempt = next_attempt(&candidate)?;
     let specs = queue_review(
         &mut candidate,
@@ -701,8 +748,9 @@ pub(super) fn respond(
             attempt,
             assessment: assessment.into(),
             draft_answer: final_answer.into(),
-            user_messages,
-            standing_instructions,
+            user_messages: context.user_messages,
+            standing_instructions: context.standing_instructions,
+            coordinator_messages: context.coordinator_messages,
             kind: ReviewKind::Delta,
             ..Default::default()
         },
@@ -754,7 +802,7 @@ pub(super) fn coordinator_hint(state: &WorkflowState, review_enabled: bool) -> O
             ));
         }
         return Some(format!(
-            "{}. Read the latest entry of state.design.reviews. For each blocking or major finding, correct the answer, disprove it with evidence, advance to do further work, or accept it as a stated risk. Then call finish with assessment, review_response and final_answer: the exact text you will deliver. If final_answer differs from the reviewed text, a short delta review checks the changes first. Deliver final_answer unchanged once the workflow completes.",
+            "{}. Read the latest entry of state.design.reviews. For each blocking or major finding, correct the answer, disprove it with evidence, advance to do further work, or accept it as a stated risk. Facts a reviewer introduces (counterexamples, counts, pairings, measurements) are claims: re-derive each one fully, not only its magnitude, before putting it in the answer. Then call finish with assessment, review_response and final_answer: the exact text you will deliver. If final_answer differs from the reviewed text, a short delta review checks the changes first. Deliver final_answer unchanged once the workflow completes.",
             summary(review)
         ));
     }
@@ -780,12 +828,11 @@ pub(super) fn coordinator_hint(state: &WorkflowState, review_enabled: bool) -> O
 /// skills) and media labels are not user text, and a compaction summary is
 /// model-written even though it is stored with the user role. Injected AGENTS.md
 /// text is kept separately as standing instructions.
-pub(super) fn user_messages<'a>(
-    items: impl Iterator<Item = &'a ResponseItem>,
-) -> (Vec<String>, Option<String>) {
+pub(super) fn user_messages<'a>(items: impl Iterator<Item = &'a ResponseItem>) -> ReviewContext {
     let mut messages = Vec::new();
     let mut standing = None;
     let mut compacted = false;
+    let mut coordinator = Vec::new();
     for item in items {
         if let ResponseItem::Message { role, content, .. } = item
             && role == "user"
@@ -797,6 +844,19 @@ pub(super) fn user_messages<'a>(
                     standing = Some(clip(text.trim(), MAX_STANDING_INSTRUCTION_CHARS));
                 }
             }
+        }
+        // What the coordinator already told the user: answers, async messages
+        // sent while work continued, and progress commentary.
+        if let Some((told, priority)) = coordinator_message(item) {
+            coordinator.push((
+                priority,
+                format!(
+                    "[after user message {}] {}",
+                    messages.len(),
+                    clip(told.trim(), MAX_COORDINATOR_MESSAGE_CHARS)
+                ),
+            ));
+            continue;
         }
         let Some(TurnItem::UserMessage(message)) = crate::event_mapping::parse_turn_item(item)
         else {
@@ -828,7 +888,83 @@ pub(super) fn user_messages<'a>(
         // than presenting a surviving message as the original request.
         kept.insert(0, COMPACTED_NOTE.to_string());
     }
-    (kept, standing)
+    ReviewContext {
+        user_messages: kept,
+        standing_instructions: standing,
+        coordinator_messages: recent_coordinator_messages(coordinator),
+    }
+}
+
+/// The most recent answers and async messages first, then the most recent
+/// commentary, in their original order. A long run of progress preambles must
+/// not push out the recommendation the user already rejected.
+fn recent_coordinator_messages(entries: Vec<(bool, String)>) -> Vec<String> {
+    let mut keep = vec![false; entries.len()];
+    let mut remaining = MAX_COORDINATOR_MESSAGES;
+    for wanted in [true, false] {
+        for (index, (priority, _)) in entries.iter().enumerate().rev() {
+            if remaining == 0 {
+                break;
+            }
+            if *priority == wanted && !keep[index] {
+                keep[index] = true;
+                remaining -= 1;
+            }
+        }
+    }
+    entries
+        .into_iter()
+        .zip(keep)
+        .filter_map(|((_, text), keep)| keep.then_some(text))
+        .collect()
+}
+
+/// The user's own words and what the coordinator already told them, captured
+/// from the owner conversation when a review starts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct ReviewContext {
+    pub user_messages: Vec<String>,
+    pub standing_instructions: Option<String>,
+    pub coordinator_messages: Vec<String>,
+}
+
+/// User-visible text from the coordinator, and whether it is an answer or an
+/// async message (true) rather than progress commentary (false). Agent mail
+/// stored with the assistant role is not something the user was told.
+fn coordinator_message(item: &ResponseItem) -> Option<(String, bool)> {
+    let (text, priority) = match item {
+        ResponseItem::Message {
+            role,
+            content,
+            phase,
+            ..
+        } if role == "assistant" => {
+            if InterAgentCommunication::is_message_content(content) {
+                return None;
+            }
+            let text = content
+                .iter()
+                .filter_map(|part| match part {
+                    ContentItem::OutputText { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (text, !matches!(phase, Some(MessagePhase::Commentary)))
+        }
+        ResponseItem::FunctionCall {
+            name, arguments, ..
+        } if name == SEND_TO_USER_TOOL => (
+            serde_json::from_str::<Value>(arguments)
+                .ok()?
+                .get("message")?
+                .as_str()?
+                .to_string(),
+            true,
+        ),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some((text, priority))
 }
 
 /// How many messages an omission note stands for, if this entry is one.
@@ -879,6 +1015,188 @@ fn fit_messages(messages: Vec<String>) -> Vec<String> {
         );
     }
     kept
+}
+
+/// Whether a word-like token names something specific: an identifier, file or
+/// path, rather than prose such as "e.g." or "left/right".
+fn is_identifier(token: &str) -> bool {
+    if !token.chars().any(char::is_alphabetic) || token.chars().count() < 3 {
+        return false;
+    }
+    if token.contains('_') || token.contains('\\') {
+        return true;
+    }
+    if token.contains('/') {
+        return token.starts_with('/') || token.contains('.');
+    }
+    // Dotted names and files ("quest_log.txt", "com.oculus.vrshell"), not
+    // abbreviations made of single letters ("e.g", "i.e").
+    token.contains('.')
+        && token
+            .split('.')
+            .filter(|part| part.chars().count() >= 2)
+            .count()
+            >= 2
+}
+
+/// Numbers with their sign, percent, ratio or a short unit word ("-3.2", "5%",
+/// "4/249", "3 days", "35 ms"), and identifiers or paths, in their original case.
+fn value_tokens(text: &str) -> Vec<String> {
+    let inner = |c: char| matches!(c, '.' | '_' | '/' | '-' | ':' | '%' | '\\');
+    // Words with their byte spans, so a unit is joined only across one space.
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut start = None;
+    for (index, c) in text.char_indices() {
+        if c.is_alphanumeric() || inner(c) {
+            start.get_or_insert(index);
+        } else if let Some(begin) = start.take() {
+            words.push((begin, index));
+        }
+    }
+    if let Some(begin) = start {
+        words.push((begin, text.len()));
+    }
+    let mut tokens = Vec::new();
+    for (index, &(begin, end)) in words.iter().enumerate() {
+        let word = &text[begin..end];
+        let ends_sentence = word.ends_with(['.', ':']);
+        // A leading '/' marks an absolute path, so it is kept.
+        let mut token = word
+            .trim_start_matches(|c: char| matches!(c, '.' | '_' | ':' | '\\'))
+            .trim_end_matches(|c: char| matches!(c, '.' | '_' | '/' | ':' | '\\'));
+        // A leading '-' is kept only as the sign of a number.
+        if token.starts_with('-') && !token[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            token = token.trim_start_matches('-');
+        }
+        token = token.trim_end_matches('-');
+        if token.is_empty() {
+            continue;
+        }
+        if token.chars().any(|c| c.is_ascii_digit()) {
+            let numeric = token
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '/' | ':' | ','));
+            let unit = words
+                .get(index + 1)
+                .filter(|(next, _)| *next == end + 1 && &text[end..*next] == " ")
+                // A unit may end the sentence ("every 3 days.").
+                .map(|&(next, next_end)| {
+                    text[next..next_end].trim_end_matches(|c: char| !c.is_alphabetic())
+                })
+                .filter(|unit| {
+                    (1..=5).contains(&unit.chars().count()) && unit.chars().all(char::is_alphabetic)
+                });
+            // Small counts mean little without their unit ("3 days", "35 ms");
+            // longer numbers are specific on their own.
+            match unit {
+                Some(unit) if numeric && !ends_sentence && token.chars().count() <= 2 => {
+                    tokens.push(format!("{token} {unit}"))
+                }
+                _ => tokens.push(token.to_string()),
+            }
+        } else if is_identifier(token) {
+            tokens.push(token.to_string());
+        }
+    }
+    tokens
+}
+
+/// Sentences of the reviewed text whose content words mostly do not appear in
+/// the final answer: dropped caveats and statements a token list cannot see.
+pub(super) fn dropped_sentences(before: &str, after: &str) -> Vec<String> {
+    let present = merge_tokens(after).into_iter().collect::<BTreeSet<_>>();
+    let mut dropped = Vec::new();
+    let mut sentence = String::new();
+    let mut chars = before.chars().peekable();
+    while let Some(c) = chars.next() {
+        sentence.push(c);
+        let end = c == '\n'
+            || (matches!(c, '.' | '!' | '?')
+                && chars.peek().is_none_or(|next| next.is_whitespace()));
+        if !end && chars.peek().is_some() {
+            continue;
+        }
+        let words = merge_tokens(&sentence).into_iter().collect::<BTreeSet<_>>();
+        if words.len() >= 4 {
+            let kept = words.iter().filter(|word| present.contains(*word)).count();
+            if (kept as f64) < words.len() as f64 * DROPPED_SENTENCE_OVERLAP {
+                dropped.push(clip(sentence.trim(), MAX_DROPPED_SENTENCE_CHARS));
+            }
+        }
+        sentence.clear();
+        if dropped.len() >= MAX_DROPPED_SENTENCES {
+            break;
+        }
+    }
+    dropped
+}
+
+fn quoted_spans(text: &str) -> Vec<String> {
+    let mut spans = Vec::new();
+    for (open, close) in [('“', '”'), ('"', '"'), ('`', '`')] {
+        // An unpaired straight quote (an inch mark, say) would invert every
+        // later pair, so straight quotes are used only when they pair up.
+        if open == close && text.matches(open).count() % 2 != 0 {
+            continue;
+        }
+        let mut rest = text;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + open.len_utf8()..];
+            let Some(end) = after.find(close) else {
+                break;
+            };
+            let span = after[..end].trim();
+            if (3..=80).contains(&span.chars().count()) {
+                spans.push(span.to_string());
+            }
+            rest = &after[end + close.len_utf8()..];
+        }
+    }
+    spans
+}
+
+/// Specific values in the reviewed text (numbers with their context, identifiers,
+/// paths and quoted spans) that no longer appear in the final answer. When every
+/// paragraph is rewritten a paragraph diff says nothing, but a dropped base rate
+/// or build number still shows up here.
+pub(super) fn dropped_values(before: &str, after: &str) -> Vec<String> {
+    let after_lower = after.to_lowercase();
+    // A number with a unit word also counts as its bare number, so "step 5" is
+    // still present when the final answer says "5 retries".
+    let after_tokens = value_tokens(after)
+        .into_iter()
+        .flat_map(|token| {
+            let token = token.to_lowercase();
+            let number = token.split(' ').next().unwrap_or_default().to_string();
+            [token, number]
+        })
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    let mut dropped = Vec::new();
+    let values = value_tokens(before)
+        .into_iter()
+        .filter(|token| {
+            let token = token.to_lowercase();
+            // A specific number ("1/310", "58.3", "35") survives a changed
+            // unit word; a single digit needs its unit to match.
+            let number = token.split(' ').next().unwrap_or_default();
+            !after_tokens.contains(&token)
+                && !(number.chars().count() > 1 && after_tokens.contains(number))
+        })
+        .chain(
+            quoted_spans(before)
+                .into_iter()
+                .filter(|span| !after_lower.contains(&span.to_lowercase())),
+        );
+    for value in values {
+        if seen.insert(value.to_lowercase()) {
+            dropped.push(value);
+        }
+        if dropped.len() >= MAX_DROPPED_VALUES {
+            break;
+        }
+    }
+    dropped
 }
 
 /// Paragraphs removed from and added to a text, for a delta reviewer to check
@@ -943,7 +1261,7 @@ pub(super) fn prompt(state: &WorkflowState, id: &str, directory: &std::path::Pat
         .position(|review| review.task_ids.iter().any(|task| task == id));
     let lens = LENSES
         .iter()
-        .chain(std::iter::once(&DELTA_LENS))
+        .chain([&DELTA_LENS, &COMBINED_LENS])
         .find(|lens| id.ends_with(&format!("_{}", lens.key)));
     let (Some(position), Some(lens)) = (position, lens) else {
         return format!(
@@ -952,9 +1270,15 @@ pub(super) fn prompt(state: &WorkflowState, id: &str, directory: &std::path::Pat
     };
     let review = &design.reviews[position];
     let delta = review.kind == ReviewKind::Delta;
+    let combined = lens.key == COMBINED_LENS.key;
     let mut prompt = if delta {
         format!(
             "You are an independent acceptance reviewer for native workflow '{}'. The coordinator's answer was already reviewed by a panel, then changed. You check the FINAL ANSWER the coordinator intends to deliver against the previously reviewed text and the panel's findings. You did not produce this work.\n\n",
+            state.plan.id
+        )
+    } else if combined {
+        format!(
+            "You are the independent acceptance reviewer for native workflow '{}'. The coordinator produced the DRAFT ANSWER below for the user's request and intends to deliver it. You did not produce this work. You are the only reviewer, so apply every checklist in your lens below. Find what is wrong or missing before the user acts on it.\n\n",
             state.plan.id
         )
     } else {
@@ -963,7 +1287,7 @@ pub(super) fn prompt(state: &WorkflowState, id: &str, directory: &std::path::Pat
             state.plan.id
         )
     };
-    prompt.push_str("Default to skepticism. A claim is supported only if you checked it against primary evidence (raw logs, captures, data files, meshes/CAD, current source, or the output of a test or script you ran) or it follows directly from evidence quoted here. Agreement with a worker report or the coordinator's assessment is not verification. Report concrete, specific, checkable issues ranked by consequence. Generic caveats count as noise and false alarms count against you. If within your lens the answer is sound, return verdict accept with no issues or only minor ones.\n\nYou are read-only: inspect files and run read-only commands. Run analysis inline (for example python -c, or a script piped on stdin) rather than writing files. Do not modify project files, settings, devices or services, and do not dispatch agents. Messages that arrive while you work are not part of your assignment.\n\nSeverity: blocking = acting on the answer as written would mislead or harm the user (a load-bearing claim is wrong, or a requested deliverable is missing or broken). major = a load-bearing claim is unsupported, an ask was narrowed or dropped, the evidence cannot carry the conclusion, or the answer conflicts with a standing user directive. minor = worth noting; it does not change what the user should do.\n");
+    prompt.push_str("Default to skepticism. A claim is supported only if you checked it against primary evidence (raw logs, captures, data files, meshes/CAD, current source, or the output of a test or script you ran) or it follows directly from evidence quoted here. Agreement with a worker report or the coordinator's assessment is not verification. Report concrete, specific, checkable issues ranked by consequence. Generic caveats count as noise and false alarms count against you. If within your lens the answer is sound, return verdict accept with no issues or only minor ones.\n\nA fact you introduce (a counterexample, count, pairing, measurement or match) is a new claim the coordinator may deliver to the user. State in its evidence exactly how you derived it: the file, query or script, and the matching tolerance or time window (for example, whether events logged milliseconds apart count as a pair). If you could not derive it rigorously, say so instead of stating it as fact.\n\nYou are read-only: inspect files and run read-only commands. Run analysis inline (for example python -c, or a script piped on stdin) rather than writing files. Do not modify project files, settings, devices or services, and do not dispatch agents. Messages that arrive while you work are not part of your assignment.\n\nSeverity: blocking = acting on the answer as written would mislead or harm the user (a load-bearing claim is wrong, or a requested deliverable is missing or broken). major = a load-bearing claim is unsupported, an ask was narrowed or dropped, the evidence cannot carry the conclusion, or the answer conflicts with a standing user directive. minor = worth noting; it does not change what the user should do.\n");
     prompt.push_str("\n## The user's messages (verbatim, oldest first)\nThis workflow serves the request near the end of this list, including any later steering. Specific asks in earlier messages may already have been answered in earlier turns; flag one as dropped only if it is clearly still open or this workflow's request depends on it. Directives about goals, priorities, scope, quality or what to avoid stay in force wherever they appear unless the user retracted them.\n");
     if review.user_messages.is_empty() {
         prompt.push_str(
@@ -999,6 +1323,12 @@ pub(super) fn prompt(state: &WorkflowState, id: &str, directory: &std::path::Pat
     if let Some(standing) = &review.standing_instructions {
         prompt.push_str(&format!("\n## Standing user instructions\n{standing}\n"));
     }
+    if !review.coordinator_messages.is_empty() {
+        prompt.push_str("\n## What the user has already been told (coordinator messages, oldest first)\nEach entry is tagged with the user message it followed. Use these to see what the user already knows, what was already tried or recommended, and how the user reacted. They are the coordinator's claims, not evidence.\n");
+        for entry in &review.coordinator_messages {
+            prompt.push_str(&format!("\n- {entry}\n"));
+        }
+    }
     prompt.push_str(&format!(
         "\n## Workflow objective (written by the coordinator)\n{}\n",
         clip(&state.plan.goal, MAX_GOAL_CHARS)
@@ -1033,12 +1363,15 @@ pub(super) fn prompt(state: &WorkflowState, id: &str, directory: &std::path::Pat
                     prompt.push_str("Some reviewers did not return a usable review; treat what they were to check as unreviewed.\n");
                 }
                 for issue in &earlier.issues {
+                    // The evidence carries how a reviewer derived its facts, so a
+                    // delta reviewer can check them with a different method.
                     prompt.push_str(&format!(
-                        "- [{:?}/{}] {}: {}\n",
+                        "- [{:?}/{}] {}: {}\n  Evidence and method: {}\n",
                         issue.severity,
                         issue.lens,
                         issue.title,
-                        clip(&issue.detail, 4_000)
+                        clip(&issue.detail, 4_000),
+                        clip(&issue.evidence, 2_000)
                     ));
                 }
                 if let Some(response) = &earlier.response {
@@ -1063,6 +1396,40 @@ pub(super) fn prompt(state: &WorkflowState, id: &str, directory: &std::path::Pat
                 "\n## Paragraphs changed since that text\n{}",
                 changed_paragraphs(&previous.draft_answer, &review.draft_answer)
             ));
+            // Against the panel's draft too: a failed earlier delta must not
+            // hide what the first change dropped.
+            let mut sources = vec![previous.draft_answer.as_str()];
+            if let Some(base) = base
+                && base != position - 1
+            {
+                sources.insert(0, design.reviews[base].draft_answer.as_str());
+            }
+            let mut values = Vec::new();
+            let mut sentences = Vec::new();
+            for source in sources {
+                for value in dropped_values(source, &review.draft_answer) {
+                    if !values.contains(&value) && values.len() < MAX_DROPPED_VALUES {
+                        values.push(value);
+                    }
+                }
+                for sentence in dropped_sentences(source, &review.draft_answer) {
+                    if !sentences.contains(&sentence) && sentences.len() < MAX_DROPPED_SENTENCES {
+                        sentences.push(sentence);
+                    }
+                }
+            }
+            if !values.is_empty() {
+                prompt.push_str("\n## Specific values dropped since that text\nThese numbers, identifiers and quoted spans appear in the reviewed text but not in the final answer. For each, decide whether dropping it is correct (it was wrong, superseded or immaterial) or loses something the user needs.\n");
+                for value in values {
+                    prompt.push_str(&format!("- {value}\n"));
+                }
+            }
+            if !sentences.is_empty() {
+                prompt.push_str("\n## Reviewed sentences largely absent from the final answer\nMost of the content words of these sentences appear nowhere in the final answer. Check each for a dropped caveat, statement or next step the user needs.\n");
+                for sentence in sentences {
+                    prompt.push_str(&format!("- {sentence}\n"));
+                }
+            }
         }
         prompt.push_str(&format!(
             "\n## Coordinator's assessment\n{}\n\n## FINAL ANSWER UNDER REVIEW (to be delivered)\n{}\n",
@@ -1110,9 +1477,17 @@ pub(super) fn prompt(state: &WorkflowState, id: &str, directory: &std::path::Pat
         }
     }
     prompt.push_str(&format!(
-        "\n## Your lens: {}\n{}\n\nReturn the structured review. List in checks_run what you actually inspected or ran.\n",
+        "\n## Your lens: {}\n{}\n",
         lens.title, lens.instructions
     ));
+    if combined {
+        for part in &LENSES {
+            prompt.push_str(&format!("\n### {}\n{}\n", part.title, part.instructions));
+        }
+    }
+    prompt.push_str(
+        "\nReturn the structured review. List in checks_run what you actually inspected or ran.\n",
+    );
     prompt
 }
 

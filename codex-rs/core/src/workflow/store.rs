@@ -228,7 +228,16 @@ impl WorkflowStore {
     }
 
     fn materialize(&self, state: &WorkflowState) -> Result<(), String> {
-        let snapshot = serde_json::to_vec_pretty(state)
+        // These files are derived views the coordinator can read. Reviewer
+        // findings stay out of them until their review panel has returned; the
+        // journal keeps them, and the commit that completes the review writes them.
+        let mut view = state.clone();
+        for (id, task) in &mut view.tasks {
+            if super::review::withheld(state, id) && task.output.is_some() {
+                task.output = Some(super::review::WITHHELD_OUTPUT.to_string());
+            }
+        }
+        let snapshot = serde_json::to_vec_pretty(&view)
             .map_err(|err| format!("encode workflow snapshot: {err}"))?;
         atomic_write(&self.directory.join("state.json"), &snapshot)?;
         let outputs = self.directory.join("outputs");
@@ -236,7 +245,11 @@ impl WorkflowStore {
             .map_err(|err| format!("create workflow outputs: {err}"))?;
         for (id, task) in &state.tasks {
             let path = outputs.join(format!("{id}.txt"));
-            match task.output.as_ref() {
+            let output = task
+                .output
+                .as_ref()
+                .filter(|_| !super::review::withheld(state, id));
+            match output {
                 Some(output) => atomic_write(&path, output.as_bytes())?,
                 None => match std::fs::remove_file(&path) {
                     Ok(()) => (),

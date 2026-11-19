@@ -246,6 +246,8 @@ pub enum Feature {
     WorkflowOrchestration,
     /// Run independent lens-specialized acceptance reviewers on a designed workflow's draft answer.
     WorkflowReview,
+    /// Use one combined acceptance reviewer instead of the specialist panel (cost/recall A/B).
+    WorkflowReviewCompact,
     /// Keep spawn model choices in append-only context instead of tool descriptions.
     ModelCatalogInContext,
     /// Inherit client-defined dynamic tools in fresh V2 subagents.
@@ -1624,6 +1626,16 @@ pub const FEATURES: &[FeatureSpec] = &[
             announcement: "",
         },
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::WorkflowReviewCompact,
+        key: "workflow_review_compact",
+        stage: Stage::Experimental {
+            name: "Compact workflow acceptance review",
+            menu_description: "Use one combined reviewer instead of four specialist reviewers, to compare cost and recall.",
+            announcement: "",
+        },
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ModelCatalogInContext,

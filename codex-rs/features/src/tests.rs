@@ -145,7 +145,13 @@ fn codex_apps_mcp_protocol_can_be_enabled_independently_of_generic_mcp() {
 fn default_enabled_features_are_stable() {
     for spec in crate::FEATURES {
         // Instant interrupts are enabled by default while retaining their development stage.
-        if spec.default_enabled && spec.id != Feature::InstantInterrupt {
+        // So are this fork's native workflows and their acceptance review: on by
+        // default, and listed as experimental so they can be switched off.
+        let fork_default_on = matches!(
+            spec.id,
+            Feature::WorkflowOrchestration | Feature::WorkflowReview
+        );
+        if spec.default_enabled && spec.id != Feature::InstantInterrupt && !fork_default_on {
             assert!(
                 matches!(spec.stage, Stage::Stable | Stage::Removed),
                 "feature `{}` is enabled by default but is not stable/removed ({:?})",

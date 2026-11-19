@@ -89,6 +89,7 @@ impl LocalAgentControl {
             }
         }
 
+        let reported = crate::workflow::reported_agent_status(child_agent_path.as_str(), &status);
         let message = match (&status, outcome.error_info) {
             (AgentStatus::Errored(error), Some(CodexErrorInfo::TooManyDenials)) => {
                 Some(format_guardian_interruption_message(
@@ -100,7 +101,7 @@ impl LocalAgentControl {
             _ => format_inter_agent_completion_message(
                 parent_agent_path.clone(),
                 child_agent_path.clone(),
-                &status,
+                &reported,
             ),
         };
         let Some(message) = message else {

@@ -120,9 +120,11 @@ struct Command {
     draft_answer: Option<String>,
     review_response: Option<String>,
     final_answer: Option<String>,
-    /// The user's own messages and standing instructions, captured for review.
-    review_context: Option<(Vec<String>, Option<String>)>,
+    /// The user's own messages, standing instructions and what the coordinator
+    /// already told the user, captured for review.
+    review_context: Option<review::ReviewContext>,
     review_enabled: bool,
+    review_compact: bool,
     max_parallel: Option<usize>,
     task_ids: Vec<String>,
     expected_revision: Option<u64>,
@@ -266,6 +268,11 @@ pub(crate) async fn execute(
         .config
         .features
         .enabled(codex_features::Feature::WorkflowReview);
+    let review_compact = step
+        .turn
+        .config
+        .features
+        .enabled(codex_features::Feature::WorkflowReviewCompact);
     let codex_home = &step.turn.config.codex_home;
     if args.action == "status" && args.workflow_id.is_none() {
         let mut entries = Vec::new();
@@ -481,8 +488,8 @@ pub(crate) async fn execute(
                         &mut next,
                         args.assessment.as_deref().unwrap_or(""),
                         args.draft_answer.as_deref().unwrap_or(""),
-                        context.0.clone(),
-                        context.1.clone(),
+                        context.clone(),
+                        review_compact,
                     )?;
                     review_context = Some(context);
                     specs
@@ -528,6 +535,7 @@ pub(crate) async fn execute(
                     final_answer: args.final_answer,
                     review_context,
                     review_enabled,
+                    review_compact,
                     max_parallel: args.max_parallel,
                     task_ids: args.task_ids,
                     expected_revision: args.expected_revision,
@@ -587,6 +595,25 @@ fn native_task_name(workflow_id: &str, task_id: &str, attempt: u32) -> String {
         encode_name_component(workflow_id),
         encode_name_component(task_id)
     )
+}
+
+const REVIEWER_RESULT_NOTICE: &str = "Acceptance reviewer finished. Its findings are withheld until the whole review panel returns; then read the merged findings in the workflow's state.design.reviews (call workflow wait or status).";
+
+/// The status other agents see for a finished child. A workflow acceptance
+/// reviewer's findings reach the coordinator only through the workflow, merged
+/// once the whole panel has returned; native mail and agent listings carry a
+/// notice instead. Field use showed coordinators acting on part of the panel.
+pub(crate) fn reported_agent_status(
+    path: &str,
+    status: &codex_protocol::protocol::AgentStatus,
+) -> codex_protocol::protocol::AgentStatus {
+    use codex_protocol::protocol::AgentStatus;
+    match status {
+        AgentStatus::Completed(_) if is_reviewer_agent_path(path) => {
+            AgentStatus::Completed(Some(REVIEWER_RESULT_NOTICE.to_string()))
+        }
+        status => status.clone(),
+    }
 }
 
 /// Whether a native agent path belongs to a workflow acceptance reviewer. Only
@@ -697,6 +724,7 @@ fn view(
                 for key in [
                     "user_messages",
                     "standing_instructions",
+                    "coordinator_messages",
                     "draft_answer",
                     "final_answer",
                 ] {
@@ -707,7 +735,11 @@ fn view(
     }
     if let Some(tasks) = result.get_mut("tasks").and_then(Value::as_object_mut) {
         for (id, task) in tasks {
-            if let Some(object) = task.as_object_mut() {
+            // A withheld reviewer's output file is not written until its panel
+            // returns, so no path is offered for it.
+            if let Some(object) = task.as_object_mut()
+                && !review::withheld(state, id)
+            {
                 object.insert(
                     "output_path".into(),
                     json!(directory.join("outputs").join(format!("{id}.txt"))),
@@ -717,6 +749,12 @@ fn view(
                 && let Some(spec) = task.get_mut("spec").and_then(Value::as_object_mut)
             {
                 spec.remove("prompt");
+            }
+            if review::withheld(state, id)
+                && let Some(object) = task.as_object_mut()
+                && object.get("output").is_some_and(|output| !output.is_null())
+            {
+                object.insert("output".into(), json!(review::WITHHELD_OUTPUT));
             }
             if state.tasks[id].spec.kind == TaskKind::Design {
                 if let Some(spec) = task.get_mut("spec").and_then(Value::as_object_mut) {
@@ -1267,15 +1305,15 @@ impl WorkflowActor {
                     finish_event = "delta_review_started";
                 } else if command.review_enabled && next.design.is_some() {
                     // Never complete unreviewed because the snapshot changed mid-call.
-                    let (messages, standing) = command.review_context.clone().ok_or(
+                    let context = command.review_context.clone().ok_or(
                         "Workflow changed while finishing; read status and call finish again",
                     )?;
                     review::begin(
                         &mut next,
                         command.assessment.as_deref().unwrap_or(""),
                         command.draft_answer.as_deref().unwrap_or(""),
-                        messages,
-                        standing,
+                        context,
+                        command.review_compact,
                     )?;
                 } else {
                     planning::finish(&mut next, command.assessment.as_deref().unwrap_or(""))?;

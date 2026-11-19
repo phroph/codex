@@ -45,11 +45,17 @@ fn begin_review(state: &mut WorkflowState) -> Vec<TaskSpec> {
         state,
         "The capture was clean, so the path is not at fault",
         DRAFT,
-        vec![
-            "USER: keep capturing until a bad-MAC failure is recorded".into(),
-            "Do not lose the higher level thread".into(),
-        ],
-        Some("# AGENTS.md instructions\nFinish the work.".into()),
+        ReviewContext {
+            user_messages: vec![
+                "USER: keep capturing until a bad-MAC failure is recorded".into(),
+                "Do not lose the higher level thread".into(),
+            ],
+            standing_instructions: Some("# AGENTS.md instructions\nFinish the work.".into()),
+            coordinator_messages: vec![
+                "[after user message 1] Interim: the capture looks clean so far".into(),
+            ],
+        },
+        false,
     )
     .unwrap()
 }
@@ -93,11 +99,20 @@ fn acceptance_review_requires_checkpoint_assessment_and_draft_answer() {
     let mut state = returned_workflow();
     let mut running = state.clone();
     running.status = RunStatus::Running;
-    assert!(begin(&mut running, "done", "answer", Vec::new(), None).is_err());
+    assert!(
+        begin(
+            &mut running,
+            "done",
+            "answer",
+            ReviewContext::default(),
+            false
+        )
+        .is_err()
+    );
     let before = state.clone();
-    let error = begin(&mut state, "done", " ", Vec::new(), None).unwrap_err();
+    let error = begin(&mut state, "done", " ", ReviewContext::default(), false).unwrap_err();
     assert!(error.contains("draft_answer"));
-    assert!(begin(&mut state, " ", "answer", Vec::new(), None).is_err());
+    assert!(begin(&mut state, " ", "answer", ReviewContext::default(), false).is_err());
     assert_eq!(state, before);
 }
 
@@ -134,11 +149,25 @@ fn acceptance_review_queues_fresh_runtime_owned_lens_reviewers() {
     assert!(awaiting_response(&state).is_none());
     // A second finish while reviewers run explains the wait instead of reviewing twice.
     assert_eq!(state.status, RunStatus::Running);
-    let error = begin(&mut state, "done", "answer", Vec::new(), None).unwrap_err();
+    let error = begin(
+        &mut state,
+        "done",
+        "answer",
+        ReviewContext::default(),
+        false,
+    )
+    .unwrap_err();
     assert!(error.contains("still checking"));
     // If the run stopped (for example, paused) the message says how to restart them.
     state.status = RunStatus::Paused;
-    let error = begin(&mut state, "done", "answer", Vec::new(), None).unwrap_err();
+    let error = begin(
+        &mut state,
+        "done",
+        "answer",
+        ReviewContext::default(),
+        false,
+    )
+    .unwrap_err();
     assert!(error.contains("resume"));
 }
 
@@ -199,6 +228,11 @@ fn acceptance_review_prompt_uses_users_words_draft_and_reports_not_planner_prose
     assert!(!prompt.contains("DESIGN RECEIPT"));
     // Each reviewer stays within its own lens.
     assert!(!prompt.contains("Requirement coverage and faithful reporting"));
+    // Reviewers see what the user was already told, and must show how they
+    // derived any fact they introduce.
+    assert!(prompt.contains("## What the user has already been told"));
+    assert!(prompt.contains("[after user message 1] Interim: the capture looks clean so far"));
+    assert!(prompt.contains("matching tolerance or time window"));
 }
 
 #[test]
@@ -252,13 +286,16 @@ fn acceptance_review_long_threads_keep_short_directives_and_real_message_numbers
         &mut state,
         "assessment",
         DRAFT,
-        vec![
-            COMPACTED_NOTE.to_string(),
-            "FIRST".into(),
-            format!("{OMITTED_NOTE}5; the full conversation is in the owner thread]"),
-            "LAST".into(),
-        ],
-        None,
+        ReviewContext {
+            user_messages: vec![
+                COMPACTED_NOTE.to_string(),
+                "FIRST".into(),
+                format!("{OMITTED_NOTE}5; the full conversation is in the owner thread]"),
+                "LAST".into(),
+            ],
+            ..ReviewContext::default()
+        },
+        false,
     )
     .unwrap();
     let prompt = super::super::task_prompt(
@@ -521,7 +558,10 @@ fn acceptance_review_delta_reviewers_read_the_users_current_messages_and_full_ro
     let mut state = returned_workflow();
     begin_review(&mut state);
     returned_review(&mut state, json!([issue("major", "Panel finding")]));
-    let fresh = (vec!["USER: also cover the travel router".to_string()], None);
+    let fresh = ReviewContext {
+        user_messages: vec!["USER: also cover the travel router".to_string()],
+        ..ReviewContext::default()
+    };
     let first = respond(
         &mut state,
         "handled",
@@ -532,7 +572,7 @@ fn acceptance_review_delta_reviewers_read_the_users_current_messages_and_full_ro
     )
     .unwrap()
     .unwrap();
-    assert_eq!(active(&state).unwrap().user_messages, fresh.0);
+    assert_eq!(active(&state).unwrap().user_messages, fresh.user_messages);
     // The first delta fails twice; the second delta still sees the whole round.
     let task = state.tasks.get_mut(&first[0].id).unwrap();
     task.status = TaskStatus::Failed;
@@ -754,7 +794,14 @@ fn acceptance_review_findings_feed_advance_and_the_next_draft_is_reviewed_afresh
     .unwrap();
     complete(&mut state, "armed_capture", "FAILURE CAPTURED");
     state.status = RunStatus::AwaitingDecision;
-    let specs = begin(&mut state, "Recorded", "DRAFT 2", Vec::new(), None).unwrap();
+    let specs = begin(
+        &mut state,
+        "Recorded",
+        "DRAFT 2",
+        ReviewContext::default(),
+        false,
+    )
+    .unwrap();
     assert_eq!(specs[0].id, "_review_2_measure");
     assert_eq!(active(&state).unwrap().round, 2);
 }
@@ -868,7 +915,16 @@ fn acceptance_review_captures_user_words_and_standing_instructions_separately() 
     .into_iter()
     .map(|value| serde_json::from_value(value).unwrap())
     .collect();
-    let (messages, standing) = user_messages(items.iter());
+    let ReviewContext {
+        user_messages: messages,
+        standing_instructions: standing,
+        coordinator_messages: told,
+    } = user_messages(items.iter());
+    // What the coordinator said is captured separately, tagged by position.
+    assert_eq!(
+        told,
+        vec!["[after user message 0] I will check".to_string()]
+    );
     // The compaction summary is excluded, and its presence is noted first.
     assert_eq!(messages.len(), 4, "{messages:?}");
     assert_eq!(messages[0], COMPACTED_NOTE);
@@ -912,7 +968,14 @@ fn acceptance_review_interrupted_reviewers_keep_the_review_open_until_retried() 
             .unwrap()
             .contains("_review_1_coverage")
     );
-    let error = begin(&mut state, "done", "answer", Vec::new(), None).unwrap_err();
+    let error = begin(
+        &mut state,
+        "done",
+        "answer",
+        ReviewContext::default(),
+        false,
+    )
+    .unwrap_err();
     assert!(error.contains("_review_1_coverage"));
     // Retrying exactly the stopped reviewer reopens the same review.
     assert!(reopen_for_retry(&mut state, &["_review_1_coverage".into()]));
@@ -1065,4 +1128,329 @@ fn acceptance_review_state_stays_compatible_with_unreviewed_journals() {
         serde_json::from_value(serde_json::to_value(&reviewed).unwrap()).unwrap();
     assert_eq!(restored, reviewed);
     model::validate_state(&restored).unwrap();
+}
+
+#[test]
+fn acceptance_review_captures_what_the_coordinator_told_the_user() {
+    let items: Vec<ResponseItem> = [
+        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"Why does the headset lose tracking?"}]}),
+        json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking the Quest logs now."}]}),
+        json!({"type":"function_call","name":"send_message_to_user_async","arguments":"{\"message\":\"Next step: confirm Developer Mode, then contact Meta support.\"}","call_id":"call-1"}),
+        json!({"type":"function_call","name":"shell","arguments":"{\"command\":\"adb devices\"}","call_id":"call-2"}),
+        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"Not helping."}]}),
+    ]
+    .into_iter()
+    .map(|value| serde_json::from_value(value).unwrap())
+    .collect();
+    let context = user_messages(items.iter());
+    assert_eq!(
+        context.user_messages,
+        vec![
+            "Why does the headset lose tracking?".to_string(),
+            "Not helping.".to_string()
+        ]
+    );
+    assert_eq!(
+        context.coordinator_messages,
+        vec![
+            "[after user message 1] Checking the Quest logs now.".to_string(),
+            "[after user message 1] Next step: confirm Developer Mode, then contact Meta support."
+                .to_string(),
+        ]
+    );
+    // Only the most recent coordinator messages are kept.
+    let many: Vec<ResponseItem> = (0..20)
+        .map(|index| {
+            serde_json::from_value(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("update {index}")}]}))
+                .unwrap()
+        })
+        .collect();
+    let told = user_messages(many.iter()).coordinator_messages;
+    assert_eq!(told.len(), MAX_COORDINATOR_MESSAGES);
+    assert_eq!(told.last().unwrap(), "[after user message 0] update 19");
+}
+
+#[test]
+fn acceptance_review_lists_values_dropped_from_the_reviewed_text() {
+    let before = "Single-hand jumps are rare: 4/249 left and 1/310 right on build 72.0.0.1234. Both headsets ran build 72.0.0.1234 and 71.5. The “shared trigger” caveat still applies; see quest_log.txt. Failures hit 5% of sessions, about once every 3 days, with drift of -3.2 dB.";
+    let after = "Single-hand jumps are rare (4/249 left). This points to the headset. Drift was 3.2 dB, every 3 hours.";
+    let dropped = dropped_values(before, after);
+    for expected in [
+        "1/310",
+        "72.0.0.1234",
+        "71.5",
+        "shared trigger",
+        "quest_log.txt",
+        "5%",
+        "3 days",
+        "-3.2",
+    ] {
+        assert!(
+            dropped.iter().any(|value| value == expected),
+            "{expected} missing from {dropped:?}"
+        );
+    }
+    assert!(!dropped.iter().any(|value| value.starts_with("4/249")));
+    // A unit that ends a sentence still joins its count, and absolute paths
+    // keep their leading '/'.
+    assert_eq!(
+        dropped_values(
+            "Failures recur about once every 3 days. Logs are in /var/log/syslog.",
+            "Failures recur about once every 3 weeks. Logs are elsewhere."
+        ),
+        vec!["3 days".to_string(), "/var/log/syslog".to_string()]
+    );
+    // Prose is not an identifier.
+    let prose = dropped_values(
+        "Check left/right hands, e.g. both, and/or restart.",
+        "Restart.",
+    );
+    assert!(prose.is_empty(), "{prose:?}");
+    // An unpaired straight quote (an inch mark) does not invert later pairs.
+    let inches = dropped_values(r#"A 2" gap, then "drift begins" later."#, "A gap.");
+    assert!(
+        !inches.iter().any(|value| value.contains("gap, then")),
+        "{inches:?}"
+    );
+    // Dropped statements that carry no number are caught at sentence level.
+    let sentences = dropped_sentences(
+        "Both headsets ran the same Horizon OS build during every jump. The trigger is shared across hands.",
+        "The trigger is shared across hands.",
+    );
+    assert_eq!(
+        sentences,
+        vec!["Both headsets ran the same Horizon OS build during every jump.".to_string()]
+    );
+    // Each value is listed once, and an unchanged text drops nothing.
+    assert_eq!(
+        dropped
+            .iter()
+            .filter(|value| *value == "72.0.0.1234")
+            .count(),
+        1
+    );
+    assert!(dropped_values(before, before).is_empty());
+    // The delta reviewer receives the list as a checklist.
+    let mut state = returned_workflow();
+    begin(
+        &mut state,
+        "assessment",
+        before,
+        ReviewContext::default(),
+        false,
+    )
+    .unwrap();
+    returned_review(&mut state, json!([issue("major", "Panel finding")]));
+    let delta = answer(&mut state, "handled", Some("Rewrote it"), Some(after))
+        .unwrap()
+        .unwrap();
+    let prompt = super::super::task_prompt(&state, &delta[0].id, std::path::Path::new("records"));
+    assert!(prompt.contains("## Specific values dropped since that text"));
+    assert!(prompt.contains("- 1/310"));
+    assert!(prompt.contains("- shared trigger"));
+    assert!(prompt.contains("## Reviewed sentences largely absent from the final answer"));
+    assert!(prompt.contains("is not independent verification"));
+    // The panel's evidence, which records how a fact was derived, reaches it too.
+    assert!(prompt.contains("Evidence and method: capture-summary.json"));
+}
+
+#[test]
+fn acceptance_review_compact_mode_runs_one_reviewer_with_every_checklist() {
+    let mut state = returned_workflow();
+    let specs = begin(
+        &mut state,
+        "The capture was clean, so the path is not at fault",
+        DRAFT,
+        ReviewContext {
+            user_messages: vec!["USER: keep capturing".into()],
+            ..ReviewContext::default()
+        },
+        true,
+    )
+    .unwrap();
+    let ids = specs
+        .iter()
+        .map(|spec| spec.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["_review_1_combined"]);
+    let prompt = super::super::task_prompt(
+        &state,
+        "_review_1_combined",
+        std::path::Path::new("records"),
+    );
+    assert!(prompt.contains("independent acceptance reviewer"));
+    assert!(prompt.contains("You are the only reviewer"));
+    for lens in &LENSES {
+        assert!(prompt.contains(lens.title), "{} missing", lens.title);
+    }
+    // One returned reviewer completes the review and its findings are collected.
+    complete(
+        &mut state,
+        "_review_1_combined",
+        &review_output(json!([issue("major", "Window too short")])),
+    );
+    assert!(collect(&mut state));
+    let review = active(&state).unwrap();
+    assert!(review.complete);
+    assert_eq!(review.issues.len(), 1);
+    assert_eq!(review.issues[0].lens, "combined");
+}
+
+#[tokio::test]
+async fn acceptance_review_withholds_reviewer_outputs_until_the_panel_returns() {
+    let home = tempfile::tempdir().unwrap();
+    let store =
+        super::super::store::WorkflowStore::new(home.path(), "owner", "review-test").unwrap();
+    let mut state = returned_workflow();
+    begin_review(&mut state);
+    complete(
+        &mut state,
+        "_review_1_measure",
+        &review_output(json!([issue("major", "Early finding")])),
+    );
+    assert!(withheld(&state, "_review_1_measure"));
+    assert!(!withheld(&state, "capture"));
+    // The derived files the coordinator can read hold no partial findings, and
+    // status offers no path to them; the journal keeps the real output.
+    store.save(&mut state, "task_completed").await.unwrap();
+    let outputs = store.directory().join("outputs");
+    assert!(!outputs.join("_review_1_measure.txt").exists());
+    assert!(outputs.join("capture.txt").exists());
+    let snapshot = std::fs::read_to_string(store.directory().join("state.json")).unwrap();
+    assert!(!snapshot.contains("Early finding"));
+    assert_eq!(store.load().await.unwrap().as_ref(), Some(&state));
+    let view = super::super::view(&state, std::path::Path::new("records"), false, true);
+    assert!(
+        view["state"]["tasks"]["_review_1_measure"]
+            .get("output_path")
+            .is_none()
+    );
+    assert!(
+        view["state"]["tasks"]["capture"]
+            .get("output_path")
+            .is_some()
+    );
+    for include_outputs in [false, true] {
+        let view = super::super::view(
+            &state,
+            std::path::Path::new("records"),
+            include_outputs,
+            true,
+        );
+        let output = view["state"]["tasks"]["_review_1_measure"]["output"]
+            .as_str()
+            .unwrap();
+        assert!(
+            output.starts_with("Withheld until the whole review panel returns"),
+            "{output}"
+        );
+        assert!(!view.to_string().contains("Early finding"));
+        // What the coordinator already told the user is not echoed back in status.
+        if !include_outputs {
+            assert!(
+                view["state"]["design"]["reviews"][0]
+                    .get("coordinator_messages")
+                    .is_none()
+            );
+        }
+    }
+    for lens in &LENS_KEYS[1..] {
+        complete(
+            &mut state,
+            &format!("_review_1_{lens}"),
+            &review_output(json!([])),
+        );
+    }
+    assert!(collect(&mut state));
+    assert!(!withheld(&state, "_review_1_measure"));
+    let view = super::super::view(&state, std::path::Path::new("records"), true, true);
+    assert!(view.to_string().contains("Early finding"));
+    store.save(&mut state, "review_completed").await.unwrap();
+    assert!(
+        std::fs::read_to_string(outputs.join("_review_1_measure.txt"))
+            .unwrap()
+            .contains("Early finding")
+    );
+    // A review superseded mid-panel never completes; its returned reviewers
+    // are shown rather than hidden for good.
+    let mut state = returned_workflow();
+    begin_review(&mut state);
+    complete(&mut state, "_review_1_measure", &review_output(json!([])));
+    supersede(&mut state);
+    assert!(!withheld(&state, "_review_1_measure"));
+    // So does a run cancelled mid-panel.
+    let mut state = returned_workflow();
+    begin_review(&mut state);
+    complete(&mut state, "_review_1_measure", &review_output(json!([])));
+    assert!(withheld(&state, "_review_1_measure"));
+    state.status = RunStatus::Cancelled;
+    assert!(!withheld(&state, "_review_1_measure"));
+}
+
+#[test]
+fn acceptance_review_native_mail_and_listings_carry_a_notice_for_reviewers() {
+    use codex_protocol::protocol::AgentStatus;
+    let reviewer = format!(
+        "/root/{}",
+        super::super::native_task_name("review-test", "_review_1_measure", 1)
+    );
+    let findings = AgentStatus::Completed(Some("{\"verdict\":\"revise\"}".into()));
+    let reported = super::super::reported_agent_status(&reviewer, &findings);
+    let AgentStatus::Completed(Some(text)) = &reported else {
+        panic!("{reported:?}");
+    };
+    assert!(text.starts_with("Acceptance reviewer finished"));
+    // Failures still reach the coordinator, and other agents are unaffected.
+    let failed = AgentStatus::Errored("boom".into());
+    assert_eq!(
+        super::super::reported_agent_status(&reviewer, &failed),
+        failed
+    );
+    let worker = format!(
+        "/root/{}",
+        super::super::native_task_name("review-test", "capture", 1)
+    );
+    assert_eq!(
+        super::super::reported_agent_status(&worker, &findings),
+        findings
+    );
+}
+
+#[test]
+fn acceptance_review_keeps_answers_over_commentary_and_skips_agent_mail() {
+    let mut items: Vec<ResponseItem> = vec![
+        serde_json::from_value(json!({"type":"message","role":"user","content":[{"type":"input_text","text":"Fix Developer Mode"}]})).unwrap(),
+        serde_json::from_value(json!({"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Confirm Pending, then contact Meta support."}]})).unwrap(),
+        serde_json::from_value(json!({"type":"message","role":"user","content":[{"type":"input_text","text":"Not helping."}]})).unwrap(),
+    ];
+    for index in 0..20 {
+        items.push(
+            serde_json::from_value(json!({"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":format!("Checking log {index}")}]}))
+                .unwrap(),
+        );
+    }
+    // Agent mail stored with the assistant role is not something the user saw.
+    let mail = serde_json::to_string(&InterAgentCommunication::new(
+        codex_protocol::AgentPath::try_from("/root/worker").unwrap(),
+        codex_protocol::AgentPath::root(),
+        Vec::new(),
+        "WORKER REPORT".into(),
+        false,
+    ))
+    .unwrap();
+    items.push(
+        serde_json::from_value(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":mail}]}))
+            .unwrap(),
+    );
+    let told = user_messages(items.iter()).coordinator_messages;
+    assert_eq!(told.len(), MAX_COORDINATOR_MESSAGES);
+    assert_eq!(
+        told[0],
+        "[after user message 1] Confirm Pending, then contact Meta support."
+    );
+    assert_eq!(
+        told.last().unwrap(),
+        "[after user message 2] Checking log 19"
+    );
+    assert!(told.iter().all(|entry| !entry.contains("WORKER REPORT")));
 }

@@ -114,6 +114,10 @@ pub(crate) struct ReviewRecord {
     /// The exact answer the coordinator delivers after answering this review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_answer: Option<String>,
+    /// What the coordinator had already told the user (progress and async
+    /// messages), each tagged with the user message it followed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coordinator_messages: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
