@@ -225,6 +225,43 @@ pub(super) fn in_progress(state: &WorkflowState) -> bool {
     active(state).is_some_and(|review| !review.complete)
 }
 
+/// The text a completed, reviewed workflow committed to deliver: the final
+/// answer of the review the coordinator answered when it finished.
+pub(super) fn delivered_text(state: &WorkflowState) -> Option<&str> {
+    if state.status != RunStatus::Completed {
+        return None;
+    }
+    let design = state.design.as_ref()?;
+    design
+        .reviews
+        .iter()
+        .rev()
+        .find(|review| !review.superseded && review.response.is_some())
+        .and_then(|review| review.final_answer.as_deref())
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// Whether `message` contains `text`, ignoring whitespace differences.
+pub(super) fn contains_normalized(message: &str, text: &str) -> bool {
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    squash(message).contains(&squash(text))
+}
+
+/// Whether `message` carries `text`: verbatim, or with most of its content words,
+/// so a reformatted answer or one combined with other text still counts.
+pub(super) fn carries(message: &str, text: &str) -> bool {
+    if contains_normalized(message, text) {
+        return true;
+    }
+    let words = merge_tokens(text).into_iter().collect::<BTreeSet<_>>();
+    if words.is_empty() {
+        return true;
+    }
+    let present = merge_tokens(message).into_iter().collect::<BTreeSet<_>>();
+    let kept = words.iter().filter(|word| present.contains(*word)).count();
+    kept as f64 >= words.len() as f64 * DROPPED_SENTENCE_OVERLAP
+}
+
 /// A reviewer's output stays out of the coordinator's view until its review is
 /// complete, so the coordinator does not act on part of the panel. Field use
 /// showed coordinators posting conclusions from three of four lenses.
@@ -1110,9 +1147,18 @@ pub(super) fn dropped_sentences(before: &str, after: &str) -> Vec<String> {
     let mut chars = before.chars().peekable();
     while let Some(c) = chars.next() {
         sentence.push(c);
-        let end = c == '\n'
-            || (matches!(c, '.' | '!' | '?')
-                && chars.peek().is_none_or(|next| next.is_whitespace()));
+        let mut end = c == '\n';
+        if matches!(c, '.' | '!' | '?') {
+            // Closing markup or quotes after the stop belong to the sentence
+            // ("**Both builds matched.** Next ..." ends at the bold marker).
+            while let Some(&next) = chars.peek()
+                && matches!(next, '*' | '_' | '`' | ')' | ']' | '"' | '\'' | '”' | '’')
+            {
+                sentence.push(next);
+                chars.next();
+            }
+            end = chars.peek().is_none_or(|next| next.is_whitespace());
+        }
         if !end && chars.peek().is_some() {
             continue;
         }

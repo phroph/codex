@@ -155,6 +155,10 @@ struct WorkflowActor {
     owner_turn: watch::Receiver<String>,
     continued_revision: Option<u64>,
     review_enabled: bool,
+    /// The owner turn in which a reviewed answer was committed for delivery.
+    /// That turn's end is checked for the delivery; nothing is persisted, so a
+    /// rebuilt actor never reports an old workflow as undelivered.
+    delivery_turn: Option<String>,
 }
 
 /// Explicit stop also applies when the coordinator is idle but its workflow is
@@ -230,6 +234,55 @@ pub(crate) async fn is_workflow_reviewer(session: &Session, agent: ThreadId) -> 
         .await
         .values()
         .any(|handle| review::is_reviewer_agent(&handle.snapshot.borrow(), &agent))
+}
+
+/// A workflow task whose attempt has ended, if `agent` ran it. Its result is part
+/// of the journal; further work sent to it directly would run outside the
+/// workflow (unrecorded, not stopped by pause, its result dropped), so callers
+/// reject it in favour of `revise` or `retry`.
+pub(crate) async fn finished_workflow_task(
+    session: &Session,
+    agent: ThreadId,
+) -> Option<(String, String)> {
+    // Identify workflow agents by their registered path, so earlier attempts of a
+    // retried task and agents of workflows not loaded since a restart count too.
+    let path = session.services.agent_control.agent_path(agent)?;
+    let (workflow, task) = workflow_task_from_path(path.as_str())?;
+    // Liveness comes from the native runtime, not the caller's own workflow state:
+    // a sibling worker or a worker's helper has no workflow manager of its own.
+    // When it cannot be determined, allow the message rather than block live work.
+    let live = session
+        .services
+        .agent_control
+        .workflow_attempt_is_running(agent)
+        .await
+        .unwrap_or(true);
+    (!live).then_some((workflow, task))
+}
+
+/// The workflow and task ids encoded in a workflow agent's native path name
+/// (`wf_<workflow>__<task>__<attempt>`), if it is one.
+fn workflow_task_from_path(path: &str) -> Option<(String, String)> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mut parts = name.strip_prefix("wf_")?.split("__");
+    let workflow = decode_name_component(parts.next()?)?;
+    let task = decode_name_component(parts.next()?)?;
+    parts.next()?.parse::<u32>().ok()?;
+    parts.next().is_none().then_some((workflow, task))
+}
+
+fn decode_name_component(encoded: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut chars = encoded.bytes();
+    while let Some(byte) = chars.next() {
+        if byte == b'_' {
+            let hex = [chars.next()?, chars.next()?];
+            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 pub(crate) async fn execute(
@@ -399,6 +452,7 @@ pub(crate) async fn execute(
             owner_turn,
             continued_revision: None,
             review_enabled,
+            delivery_turn: None,
         };
         tokio::spawn(actor.run());
     }
@@ -512,12 +566,21 @@ pub(crate) async fn execute(
                         .map(|t| t.spec.clone())
                         .collect()
                 }
-                "resume" => state
-                    .tasks
-                    .values()
-                    .filter(|t| t.status == TaskStatus::Pending)
-                    .map(|t| t.spec.clone())
-                    .collect(),
+                "resume" => {
+                    // Work that failed on a transient account limit runs again, with
+                    // anything it blocked.
+                    let mut resumed = state.clone();
+                    let transient = transient_failures(&resumed);
+                    if !transient.is_empty() {
+                        model::reset_tasks(&mut resumed, &transient)?;
+                    }
+                    resumed
+                        .tasks
+                        .values()
+                        .filter(|t| t.status == TaskStatus::Pending)
+                        .map(|t| t.spec.clone())
+                        .collect()
+                }
                 _ => Vec::new(),
             };
             let prepared = prepare_tasks(&session, &step, call_id, &state, &specs).await?;
@@ -572,6 +635,46 @@ pub(crate) async fn execute(
         args.include_outputs,
         review_enabled,
     ))
+}
+
+/// Errors that end an attempt for an account-wide, temporary reason (a usage or
+/// rate limit) rather than because of the task itself.
+fn is_transient_error(error: &str) -> bool {
+    // A billing "quota exceeded" is permanent, so it is not listed.
+    let error = error.to_lowercase();
+    ["usage limit", "rate limit", "too many requests"]
+        .iter()
+        .any(|pattern| error.contains(pattern))
+}
+
+/// Work tasks that failed on a transient limit and whose failure nothing has
+/// consumed yet. Resume runs them again with the work they blocked. A failure a
+/// later design or a finished or running task already built on is left to an
+/// explicit retry, so resume never fails because of this reset. Review tasks are
+/// excluded: a failed reviewer is reported to the coordinator and retried
+/// explicitly.
+fn transient_failures(state: &WorkflowState) -> Vec<String> {
+    state
+        .tasks
+        .iter()
+        .filter(|(_, task)| {
+            task.status == TaskStatus::Failed
+                && task.spec.kind != TaskKind::Review
+                && task.error.as_deref().is_some_and(is_transient_error)
+        })
+        .filter(|(id, _)| {
+            let mut probe = state.clone();
+            model::reset_tasks(&mut probe, &[(*id).clone()]).is_ok_and(|affected| {
+                affected.iter().filter(|other| *other != *id).all(|other| {
+                    !matches!(
+                        state.tasks[other].status,
+                        TaskStatus::Completed | TaskStatus::Running
+                    )
+                })
+            })
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// Workflow IDs allow uppercase letters and hyphens; native agent names do
@@ -1115,6 +1218,7 @@ impl WorkflowActor {
 
     async fn on_outcome(&mut self, outcome: WorkflowAgentOutcome) -> Result<(), String> {
         if outcome.thread_id == self.owner_id {
+            self.check_delivery(&outcome).await;
             if matches!(
                 outcome.status,
                 AgentStatus::Interrupted
@@ -1123,7 +1227,13 @@ impl WorkflowActor {
                     | AgentStatus::NotFound
             ) {
                 self.owner_idle_turn = None;
-                return self.stop(false, "coordinator interrupted or closed").await;
+                // Keep the actual cause (for example a usage limit) for the user and
+                // for resume, rather than a generic label.
+                let reason = match &outcome.status {
+                    AgentStatus::Errored(error) => format!("coordinator turn failed: {error}"),
+                    _ => "coordinator interrupted or closed".to_string(),
+                };
+                return self.stop(false, &reason).await;
             }
             if outcome.idle
                 && matches!(outcome.status, AgentStatus::Completed(_))
@@ -1299,7 +1409,9 @@ impl WorkflowActor {
                     )?;
                     if delta.is_none() {
                         self.observed_terminal.store(true, Ordering::Release);
-                        return self.commit(next, "finished_after_review").await;
+                        self.commit(next, "finished_after_review").await?;
+                        self.delivery_turn = Some(command.step.turn.sub_id.clone());
+                        return Ok(());
                     }
                     // The delivered text changed after review; run the delta reviewer.
                     finish_event = "delta_review_started";
@@ -1331,6 +1443,11 @@ impl WorkflowActor {
             "resume" => {
                 if next.status == RunStatus::Cancelled {
                     return Err("Cancelled workflows cannot resume; create a new workflow".into());
+                }
+                let transient = transient_failures(&next);
+                if !transient.is_empty() {
+                    let affected = model::reset_tasks(&mut next, &transient)?;
+                    self.ensure_attempts_stopped(&affected).await?;
                 }
             }
             _ => return Err("unsupported workflow mutation".into()),
@@ -1395,15 +1512,24 @@ impl WorkflowActor {
 
     async fn stop(&mut self, cancel: bool, reason: &str) -> Result<(), String> {
         let cancel = cancel || self.state.status == RunStatus::Cancelled;
-        if matches!(
-            self.state.status,
-            RunStatus::Completed | RunStatus::Cancelled
-        ) && !self
+        let running = self
             .state
             .tasks
             .values()
-            .any(|task| task.status == TaskStatus::Running)
+            .any(|task| task.status == TaskStatus::Running);
+        if !running
+            && (matches!(
+                self.state.status,
+                RunStatus::Completed | RunStatus::Cancelled
+            ) || (!cancel
+                && matches!(
+                    self.state.status,
+                    RunStatus::Paused | RunStatus::NeedsAttention
+                )))
         {
+            // Nothing is running to stop. Pausing an already stopped run would only
+            // overwrite its more informative status and error (for example a task
+            // that failed on a usage limit) and journal a duplicate stop event.
             return Ok(());
         }
         let active = self
@@ -1513,17 +1639,6 @@ impl WorkflowActor {
     }
 
     async fn notify_owner(&self) {
-        let Some(_owner) = self.owner.upgrade() else {
-            return;
-        };
-        let Some(prepared) = self.prepared.values().next() else {
-            return;
-        };
-        let Ok(resume_config) =
-            crate::agent::child_config::build_agent_resume_config(&prepared.turn)
-        else {
-            return;
-        };
         let hint = review::coordinator_hint(&self.state, self.review_enabled)
             .map(|hint| format!(" {hint}"))
             .unwrap_or_default();
@@ -1535,6 +1650,53 @@ impl WorkflowActor {
             self.state.plan.id,
             self.store.directory().display()
         );
+        self.send_owner_mail(text).await;
+    }
+
+    /// The owner turn in which a reviewed answer was committed for delivery has
+    /// ended. If its last message did not carry that answer (the turn failed, was
+    /// interrupted, or ended on other text), queue the answer for the owner's next
+    /// turn, so a reviewed result is never silently stranded.
+    async fn check_delivery(&mut self, outcome: &WorkflowAgentOutcome) {
+        if self.delivery_turn.as_deref() != Some(outcome.turn_id.as_str()) {
+            return;
+        }
+        let delivered = match &outcome.status {
+            AgentStatus::Completed(Some(message)) => review::delivered_text(&self.state)
+                .is_none_or(|text| review::carries(message, text)),
+            AgentStatus::Completed(None)
+            | AgentStatus::Errored(_)
+            | AgentStatus::Interrupted
+            | AgentStatus::Shutdown
+            | AgentStatus::NotFound => false,
+            AgentStatus::PendingInit | AgentStatus::Running => return,
+        };
+        self.delivery_turn = None;
+        let Some(text) = review::delivered_text(&self.state).map(str::to_string) else {
+            return;
+        };
+        if delivered {
+            return;
+        }
+        self.send_owner_mail(format!(
+            "<workflow_status>\nWorkflow {} completed after acceptance review, but its reviewed final answer may not have reached the user: the turn that finished it ended without delivering that text. Unless you already gave the user this answer in full, deliver it now, unchanged:\n\n{text}\n\nRecords: {}\n</workflow_status>",
+            self.state.plan.id,
+            self.store.directory().display()
+        ))
+        .await;
+    }
+
+    async fn send_owner_mail(&self, text: String) {
+        let Some(_owner) = self.owner.upgrade() else {
+            return;
+        };
+        // The coordinator's own latest step, which every command refreshes; an actor
+        // rebuilt after a restart has no prepared dispatch settings to borrow from.
+        let Ok(resume_config) =
+            crate::agent::child_config::build_agent_resume_config(&self.design_step.turn)
+        else {
+            return;
+        };
         // Use native attributed mail, never a synthetic human-authored message.
         if let Err(error) = self
             .control

@@ -1454,3 +1454,105 @@ fn acceptance_review_keeps_answers_over_commentary_and_skips_agent_mail() {
     );
     assert!(told.iter().all(|entry| !entry.contains("WORKER REPORT")));
 }
+
+#[test]
+fn acceptance_review_dropped_sentences_end_at_closing_markup() {
+    // A bolded or quoted sentence ends at its closing marker, so a dropped one is
+    // reported on its own instead of merging with the next sentence.
+    let before = "**Both headsets ran the same Horizon OS build during every jump.** The trigger is shared across hands. He said \"retry the pairing after the firmware update finishes.\" Done.";
+    let after = "The trigger is shared across hands. Done.";
+    let dropped = dropped_sentences(before, after);
+    assert_eq!(
+        dropped,
+        vec![
+            "**Both headsets ran the same Horizon OS build during every jump.**".to_string(),
+            "He said \"retry the pairing after the firmware update finishes.\"".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn acceptance_review_delivered_text_is_the_answered_final_answer() {
+    let mut state = returned_workflow();
+    begin_review(&mut state);
+    returned_review(&mut state, json!([issue("major", "Panel finding")]));
+    assert_eq!(delivered_text(&state), None);
+    assert!(
+        answer(&mut state, "handled", Some("Fixed"), Some(DRAFT))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(state.status, RunStatus::Completed);
+    assert_eq!(delivered_text(&state), Some(DRAFT));
+    assert!(contains_normalized(
+        &format!("Summary first.\n\n{}\n\nThanks.", DRAFT.replace(' ', "  ")),
+        DRAFT
+    ));
+    assert!(!contains_normalized("Something else entirely.", DRAFT));
+}
+
+#[test]
+fn workflow_agents_are_recognised_by_path_and_transient_failures_resume() {
+    use super::super::native_task_name;
+    use super::super::transient_failures;
+    use super::super::workflow_task_from_path;
+    let path = format!(
+        "/root/{}",
+        native_task_name("Router-Audit_2", "capture_v4", 3)
+    );
+    assert_eq!(
+        workflow_task_from_path(&path),
+        Some(("Router-Audit_2".to_string(), "capture_v4".to_string()))
+    );
+    assert_eq!(workflow_task_from_path("/root/helper"), None);
+    assert_eq!(workflow_task_from_path("/root/wf_notreally"), None);
+    // A usage-limit failure is transient; a task's own failure is not, and a
+    // failed reviewer is left to an explicit retry.
+    let mut state = returned_workflow();
+    let capture = state.tasks.get_mut("capture").unwrap();
+    capture.status = TaskStatus::Failed;
+    capture.error = Some("You\u{2019}ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits.".into());
+    assert_eq!(transient_failures(&state), vec!["capture".to_string()]);
+    state.tasks.get_mut("capture").unwrap().error = Some("tests failed: 3 assertions".into());
+    assert!(transient_failures(&state).is_empty());
+    begin_review(&mut state);
+    let reviewer = state.tasks.get_mut("_review_1_measure").unwrap();
+    reviewer.status = TaskStatus::Failed;
+    reviewer.error = Some("usage limit reached".into());
+    assert!(transient_failures(&state).is_empty());
+}
+
+#[test]
+fn workflow_resume_leaves_consumed_transient_failures_to_an_explicit_retry() {
+    use super::super::transient_failures;
+    let mut state = returned_workflow();
+    let capture = state.tasks.get_mut("capture").unwrap();
+    capture.status = TaskStatus::Failed;
+    capture.error = Some("You\u{2019}ve hit your usage limit.".into());
+    assert_eq!(transient_failures(&state), vec!["capture".to_string()]);
+    // A later design built on that failure; resetting it would discard the design.
+    let design = planning::advance(&mut state, "Capture failed on the quota; redesign").unwrap();
+    complete(&mut state, &design.id, "DESIGN RECEIPT: round two");
+    assert!(transient_failures(&state).is_empty());
+    // A billing quota is permanent, not transient.
+    let mut state = returned_workflow();
+    let capture = state.tasks.get_mut("capture").unwrap();
+    capture.status = TaskStatus::Failed;
+    capture.error = Some("Quota exceeded. Check your plan and billing details.".into());
+    assert!(transient_failures(&state).is_empty());
+}
+
+#[test]
+fn acceptance_review_delivery_tolerates_reformatting_but_not_other_text() {
+    let reviewed = "The capture window was too short: five bad-MAC failures averaged 42.6 minutes apart, so a 10-minute clean window had about a 21% chance of catching one. Keep the capture running until a failure is recorded.";
+    let reformatted = "**Summary.** The capture window was too short — five bad-MAC failures averaged 42.6 minutes apart, so a 10-minute clean window had only ~21% chance of catching one.\n\nNext: keep the capture running until a failure is recorded.";
+    assert!(carries(reformatted, reviewed));
+    assert!(carries(
+        &format!("Router audit done.\n\n{reviewed}"),
+        reviewed
+    ));
+    assert!(!carries(
+        "I'll combine this with the inventory results shortly.",
+        reviewed
+    ));
+}

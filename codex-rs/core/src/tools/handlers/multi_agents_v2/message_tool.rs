@@ -60,6 +60,13 @@ pub(super) async fn handle_message_string_tool(
             "That agent is a workflow acceptance reviewer. Reviewers stay independent of the coordinator: do not message, steer or reassign them. Read their findings with workflow status; for new work, spawn a worker or revise the workflow.".to_string(),
         ));
     }
+    if let Some((workflow, task)) =
+        crate::workflow::finished_workflow_task(&session, receiver_thread_id).await
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "That agent ran task '{task}' of workflow '{workflow}', and that attempt has ended; its result is recorded in the workflow. Work sent to it directly would run outside the workflow: unrecorded, not stopped by pause, and its result dropped. Add a task with workflow revise, or rerun this one with workflow retry."
+        )));
+    }
     analytics.set_receiver(receiver_thread_id);
     let resume_config =
         build_agent_resume_config(&turn).map_err(FunctionCallError::RespondToModel)?;
